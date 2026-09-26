@@ -1951,6 +1951,10 @@ Sema::ConditionResult Parser::ParseCondition(StmtResult *InitStmt,
     }
   }
 
+  // Mesh parameter modifiers are identifiers in condition expressions.
+  if (getLangOpts().HLSL && Tok.isOneOf(tok::kw_vertices, tok::kw_indices,
+                                     tok::kw_primitives, tok::kw_payload))
+    Tok.setKind(tok::identifier);
   // Determine what kind of thing we have.
   switch (isCXXConditionDeclarationOrInitStatement(InitStmt, FRI)) {
   case ConditionOrInitStatement::Expression: {

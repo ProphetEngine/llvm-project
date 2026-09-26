@@ -1058,6 +1058,15 @@ accesses have been completed and all threads in the group have reached this call
   let IsConvergent = 1;
 }
 
+// Specifies the number of vertices and primitives produced by a mesh shader.
+def hlsl_set_mesh_output_counts :
+    HLSLBuiltin<"SetMeshOutputCounts",
+                "__builtin_hlsl_set_mesh_output_counts"> {
+  let Args = [UIntTy, UIntTy];
+  let IsConvergent = 1;
+  let Availability = SM6_5;
+}
+
 // Blocks execution of all threads in a group until all group shared accesses
 // have been completed.
 def hlsl_group_memory_barrier :
@@ -1070,6 +1079,7 @@ accesses have been completed.
 }];
   let IsConvergent = 1;
 }
+
 
 // Blocks execution of all threads in a group until all group shared accesses
 // have been completed and all threads in the group have reached this call.
@@ -1893,6 +1903,19 @@ def hlsl_wave_prefix_sum :
 \param Val The input value.
 }];
   let VaryingTypes = AllNumericTypes;
+  let IsConvergent = 1;
+  let Availability = SM6_0;
+  let VaryingMatDims = [];
+}
+
+// Reads the value from the first active lane in the wave.
+def hlsl_wave_read_lane_first :
+    HLSLOneArgBuiltin<"WaveReadLaneFirst", "__builtin_hlsl_wave_read_lane_first"> {
+  let Doc = [{
+\brief Returns the value of the expression from the first active lane.
+\param Val The value to read.
+}];
+  let VaryingTypes = AllTypesWithBool;
   let IsConvergent = 1;
   let Availability = SM6_0;
   let VaryingMatDims = [];

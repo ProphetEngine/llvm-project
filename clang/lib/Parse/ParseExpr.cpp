@@ -886,6 +886,10 @@ Parser::ParseCastExpression(CastParseKind ParseKind, bool isAddressOfOperand,
                                CorrectionBehavior, isVectorLiteral,
                                NotPrimaryExpression);
 
+  case tok::kw_vertices:
+  case tok::kw_indices:
+  case tok::kw_primitives:
+  case tok::kw_payload:
   case tok::identifier:
   ParseIdentifier: {    // primary-expression: identifier
                         // unqualified-id: identifier

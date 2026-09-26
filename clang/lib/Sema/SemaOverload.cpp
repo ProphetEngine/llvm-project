@@ -15635,7 +15635,7 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
   const Type *LHSTy = Args[0]->getType().getTypePtr();
   if (Opc == BO_Assign &&
       (!LHSTy->isOverloadableType() ||
-       (getLangOpts().HLSL && LHSTy->isRecordType() &&
+       (getLangOpts().HLSL && !getLangOpts().HLSLCPlusPlus && LHSTy->isRecordType() &&
         !LHSTy->getAsCXXRecordDecl()->isHLSLBuiltinRecord())))
     return CreateBuiltinBinOp(OpLoc, Opc, Args[0], Args[1]);
 

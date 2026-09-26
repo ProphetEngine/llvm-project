@@ -99,6 +99,9 @@ set(hlsl_subdir_files
   hlsl/hlsl_intrinsics.h
   hlsl/hlsl_detail.h
   hlsl/hlsl_resources.h
+  hlsl/hlsl_geometry.h
+  hlsl/hlsl_patch.h
+  hlsl/hlsl_raytracing.h
   hlsl/hlsl_spirv.h
   )
 set(hlsl_files

@@ -818,8 +818,17 @@ static void instantiateDependentHLSLParamModifierAttr(
   }
 
   const Type *OldParmTy = cast<ParmVarDecl>(Old)->getType().getTypePtr();
-  if (OldParmTy->isDependentType() && Attr->isAnyOut())
-    NewParm->setType(S.HLSL().getInoutParameterType(NewParm->getType()));
+  if (OldParmTy->isDependentType() && Attr->isAnyOut()) {
+    QualType T = NewParm->getType();
+    if (T->isReferenceType() || T->isPointerType()) {
+      unsigned ID = S.getDiagnostics().getCustomDiagID(DiagnosticsEngine::Error,
+          "out/inout parameters cannot instantiate a C++ pointer or reference type");
+      S.Diag(NewParm->getLocation(), ID);
+      NewParm->setInvalidDecl();
+      return;
+    }
+    NewParm->setType(S.HLSL().getInoutParameterType(T));
+  }
 
   assert(
       (!Attr->isAnyOut() || (NewParm->getType().isRestrictQualified() &&

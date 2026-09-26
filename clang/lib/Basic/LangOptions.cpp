@@ -134,7 +134,7 @@ void LangOptions::setLangDefaults(LangOptions &Opts, Language Lang,
   Opts.AllowLiteralDigitSeparator = Std.allowLiteralDigitSeparator();
   Opts.NamedLoops = Std.isC2y();
 
-  Opts.HLSL = Lang == Language::HLSL;
+  Opts.HLSL = Lang == Language::HLSL || Opts.HLSLCPlusPlus;
   if (Opts.HLSL) {
     if (Opts.IncludeDefaultHeader)
       Includes.push_back("hlsl.h");
@@ -193,6 +193,8 @@ void LangOptions::setLangDefaults(LangOptions &Opts, Language Lang,
   default:
     break;
   }
+
+  if (Opts.HLSLCPlusPlus) Opts.setHLSLVersion(LangOptions::HLSL_202x);
 
   // OpenCL has some additional defaults.
   if (Opts.OpenCL) {

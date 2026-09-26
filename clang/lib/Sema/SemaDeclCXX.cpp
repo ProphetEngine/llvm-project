@@ -2915,7 +2915,7 @@ CXXBaseSpecifier *Sema::CheckBaseSpecifier(CXXRecordDecl *Class,
   }
 
   // In HLSL, unspecified class access is public rather than private.
-  if (getLangOpts().HLSL && Class->getTagKind() == TagTypeKind::Class &&
+  if (getLangOpts().HLSL && !getLangOpts().HLSLCPlusPlus && Class->getTagKind() == TagTypeKind::Class &&
       Access == AS_none)
     Access = AS_public;
 
@@ -3574,8 +3574,8 @@ Sema::ActOnCXXMemberDeclarator(Scope *S, AccessSpecifier AS, Declarator &D,
     }
   }
 
-  // HLSL prohibits user defined constructors and destructors.
-  if (getLangOpts().HLSL) {
+  // Strict HLSL has value records; Shader C++ retains C++ object semantics.
+  if (getLangOpts().HLSL && !getLangOpts().HLSLCPlusPlus) {
     switch (Name.getNameKind()) {
     case DeclarationName::CXXConstructorName:
     case DeclarationName::CXXDestructorName:
@@ -15463,7 +15463,7 @@ void Sema::DefineImplicitCopyAssignment(SourceLocation CurrentLocation,
     ObjectType = getCurrentThisType();
     This.emplace();
     DerefThis.emplace(*This);
-    IsArrow = !LangOpts.HLSL;
+    IsArrow = (!LangOpts.HLSL || LangOpts.HLSLCPlusPlus);
   }
   ExprBuilder &ObjectParameter =
       ExplicitObject ? static_cast<ExprBuilder &>(*ExplicitObject)
@@ -15600,7 +15600,7 @@ void Sema::DefineImplicitCopyAssignment(SourceLocation CurrentLocation,
     // Add a "return *this;"
     Expr *ThisExpr =
         (ExplicitObject  ? static_cast<ExprBuilder &>(*ExplicitObject)
-         : LangOpts.HLSL ? static_cast<ExprBuilder &>(*This)
+         : (LangOpts.HLSL && !LangOpts.HLSLCPlusPlus) ? static_cast<ExprBuilder &>(*This)
                          : static_cast<ExprBuilder &>(*DerefThis))
             .build(*this, Loc);
     StmtResult Return = BuildReturnStmt(Loc, ThisExpr);
@@ -15866,7 +15866,7 @@ void Sema::DefineImplicitMoveAssignment(SourceLocation CurrentLocation,
     ObjectType = getCurrentThisType();
     This.emplace();
     DerefThis.emplace(*This);
-    IsArrow = !getLangOpts().HLSL;
+    IsArrow = (!getLangOpts().HLSL || getLangOpts().HLSLCPlusPlus);
   }
   ExprBuilder &ObjectParameter =
       ExplicitObject ? *ExplicitObject : static_cast<ExprBuilder &>(*This);
@@ -16014,7 +16014,7 @@ void Sema::DefineImplicitMoveAssignment(SourceLocation CurrentLocation,
     // Add a "return *this;"
     Expr *ThisExpr =
         (ExplicitObject  ? static_cast<ExprBuilder &>(*ExplicitObject)
-         : LangOpts.HLSL ? static_cast<ExprBuilder &>(*This)
+         : (LangOpts.HLSL && !LangOpts.HLSLCPlusPlus) ? static_cast<ExprBuilder &>(*This)
                          : static_cast<ExprBuilder &>(*DerefThis))
             .build(*this, Loc);
 

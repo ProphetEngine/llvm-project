@@ -304,7 +304,7 @@ public:
   Expr *getResourceCounterHandleExpr();
 
   template <typename T> MemberExpr *createMemberExpr(T Base, FieldDecl *Field);
-  CXXThisExpr *createThisExpr();
+  Expr *createThisExpr();
 
 private:
   void createDecl();
@@ -676,10 +676,13 @@ MemberExpr *BuiltinTypeMethodBuilder::createMemberExpr(T Base,
                                     Member->getType(), VK_LValue, OK_Ordinary);
 }
 
-CXXThisExpr *BuiltinTypeMethodBuilder::createThisExpr() {
-  CXXThisExpr *This =
-      CXXThisExpr::Create(getASTContext(), SourceLocation(),
-                          Method->getFunctionObjectParameterType(), true);
+Expr *BuiltinTypeMethodBuilder::createThisExpr() {
+  QualType T = getASTContext().getLangOpts().HLSLCPlusPlus
+                   ? Method->getThisType()
+                   : Method->getFunctionObjectParameterType();
+  CXXThisExpr *This = CXXThisExpr::Create(getASTContext(), SourceLocation(), T, true);
+  if (T->isPointerType())
+    return DeclBuilder.SemaRef.BuildUnaryOp(nullptr, SourceLocation(), UO_Deref, This).get();
   return This;
 }
 

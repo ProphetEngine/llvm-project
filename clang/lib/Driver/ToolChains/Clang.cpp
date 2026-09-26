@@ -3978,7 +3978,10 @@ static void RenderHLSLOptions(const Driver &D, const ArgList &Args,
       options::OPT_fhlsl_spv_use_legacy_buffer_matrix_order,
       options::OPT_fhlsl_spv_enable_maximal_reconvergence,
       options::OPT_fhlsl_spv_preserve_interface};
-  if (!types::isHLSL(InputType))
+  bool ShaderCpp = Args.hasArg(options::OPT_fshader_cxx);
+  if (ShaderCpp)
+    CmdArgs.push_back("-fshader-c++");
+  if (!types::isHLSL(InputType) && !ShaderCpp)
     return;
   for (const auto &Arg : ForwardedArguments)
     if (const auto *A = Args.getLastArg(Arg))

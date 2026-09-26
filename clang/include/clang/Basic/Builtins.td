@@ -5870,6 +5870,17 @@ def HLSLGroupMemoryBarrier : LangBuiltin<"HLSL_LANG"> {
   let Prototype = "void()";
 }
 
+def HLSLDispatchMesh : LangBuiltin<"HLSL_LANG"> {
+  let Spellings = ["__builtin_hlsl_dispatch_mesh"];
+  let Attributes = [NoThrow, NoReturn];
+  let Prototype = "void(unsigned int, unsigned int, unsigned int, ...)";
+}
+
+def HLSLSetMeshOutputCounts : LangBuiltin<"HLSL_LANG"> {
+  let Spellings = ["__builtin_hlsl_set_mesh_output_counts"];
+  let Attributes = [NoThrow, Const];
+  let Prototype = "void(unsigned int, unsigned int)";
+}
 def HLSLGroupMemoryBarrierWithGroupSync: LangBuiltin<"HLSL_LANG"> {
   let Spellings = ["__builtin_hlsl_group_memory_barrier_with_group_sync"];
   let Attributes = [NoThrow, Const];

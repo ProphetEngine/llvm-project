@@ -1856,7 +1856,7 @@ QualType Sema::BuildPointerType(QualType T,
     return QualType();
   }
 
-  if (getLangOpts().HLSL && Loc.isValid()) {
+  if (getLangOpts().HLSL && !getLangOpts().HLSLCPlusPlus && Loc.isValid()) {
     Diag(Loc, diag::err_hlsl_pointers_unsupported) << 0;
     return QualType();
   }
@@ -1929,7 +1929,7 @@ QualType Sema::BuildReferenceType(QualType T, bool SpelledAsLValue,
     return QualType();
   }
 
-  if (getLangOpts().HLSL && Loc.isValid()) {
+  if (getLangOpts().HLSL && !getLangOpts().HLSLCPlusPlus && Loc.isValid()) {
     Diag(Loc, diag::err_hlsl_pointers_unsupported) << 1;
     return QualType();
   }
@@ -2813,7 +2813,7 @@ QualType Sema::BuildMemberPointerType(QualType T, const CXXScopeSpec &SS,
     return QualType();
   }
 
-  if (getLangOpts().HLSL && Loc.isValid()) {
+  if (getLangOpts().HLSL && !getLangOpts().HLSLCPlusPlus && Loc.isValid()) {
     Diag(Loc, diag::err_hlsl_pointers_unsupported) << 0;
     return QualType();
   }
@@ -5779,8 +5779,16 @@ static TypeSourceInfo *GetFullTypeForDeclarator(TypeProcessingState &state,
   if (!AreDeclaratorChunksValid)
     return Context.getTrivialTypeSourceInfo(T);
 
-  if (state.didParseHLSLParamMod() && !T->isConstantArrayType())
-    T = S.HLSL().getInoutParameterType(T);
+  if (state.didParseHLSLParamMod() && !T->isConstantArrayType()) {
+    if (T->isReferenceType() || T->isPointerType()) {
+      unsigned ID = S.getDiagnostics().getCustomDiagID(DiagnosticsEngine::Error,
+          "out/inout parameters cannot also use a C++ pointer or reference type");
+      S.Diag(D.getIdentifierLoc(), ID);
+      D.setInvalidType();
+    } else {
+      T = S.HLSL().getInoutParameterType(T);
+    }
+  }
   return GetTypeSourceInfoForDeclarator(state, T, TInfo);
 }
 

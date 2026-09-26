@@ -143,6 +143,12 @@ StmtResult Parser::ParseStatementOrDeclarationAfterAttributes(
   // the token to end in a semicolon (in which case SemiError should be set),
   // or they directly 'return;' if not.
 Retry:
+  // Mesh parameter modifiers are contextual in HLSL. The same spellings
+  // commonly name the output arrays inside the shader body.
+  if (getLangOpts().HLSL &&
+      Tok.isOneOf(tok::kw_vertices, tok::kw_indices,
+                  tok::kw_primitives, tok::kw_payload))
+    Tok.setKind(tok::identifier);
   tok::TokenKind Kind  = Tok.getKind();
   SourceLocation AtLoc;
   switch (Kind) {

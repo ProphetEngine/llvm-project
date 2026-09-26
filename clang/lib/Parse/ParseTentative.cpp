@@ -1287,10 +1287,21 @@ Parser::isCXXDeclarationSpecifier(ImplicitTypenameContext AllowImplicitTypename,
   case tok::kw_pipe:
 
     // HLSL address space qualifiers
-  case tok::kw_groupshared:
+  case tok::kw_precise:
+    case tok::kw_globallycoherent:
+    case tok::kw_groupshared:
   case tok::kw_in:
   case tok::kw_inout:
   case tok::kw_out:
+  case tok::kw_point:
+  case tok::kw_line:
+  case tok::kw_lineadj:
+  case tok::kw_triangle:
+  case tok::kw_triangleadj:
+  case tok::kw_vertices:
+  case tok::kw_indices:
+  case tok::kw_primitives:
+  case tok::kw_payload:
     // HLSL matrix layout qualifiers
   case tok::kw_row_major:
   case tok::kw_column_major:

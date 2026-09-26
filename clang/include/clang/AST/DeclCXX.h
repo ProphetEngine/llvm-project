@@ -769,7 +769,7 @@ public:
   ///
   /// This value is used for lazy creation of default constructors.
     bool needsImplicitDefaultConstructor() const {
-    return (!getLangOpts().HLSL || isHLSLBuiltinRecord()) &&
+    return (!getLangOpts().HLSL || getLangOpts().HLSLCPlusPlus || isHLSLBuiltinRecord()) &&
            ((!data().UserDeclaredConstructor &&
             !(data().DeclaredSpecialMembers & SMF_DefaultConstructor) &&
             (!isLambda() || lambdaIsDefaultConstructibleAndAssignable())) ||
@@ -804,7 +804,7 @@ public:
   /// constructor to be lazily declared.
   bool needsImplicitCopyConstructor() const {
     return !(data().DeclaredSpecialMembers & SMF_CopyConstructor) &&
-           (!getLangOpts().HLSL || isHLSLBuiltinRecord());
+           (!getLangOpts().HLSL || getLangOpts().HLSLCPlusPlus || isHLSLBuiltinRecord());
   }
 
   /// Determine whether we need to eagerly declare a defaulted copy
@@ -898,7 +898,7 @@ public:
   /// constructor or if any existing special member function inhibits this.
   bool needsImplicitMoveConstructor() const {
     return !(data().DeclaredSpecialMembers & SMF_MoveConstructor) &&
-           (!getLangOpts().HLSL || isHLSLBuiltinRecord()) &&
+           (!getLangOpts().HLSL || getLangOpts().HLSLCPlusPlus || isHLSLBuiltinRecord()) &&
            !hasUserDeclaredCopyConstructor() &&
            !hasUserDeclaredCopyAssignment() &&
            !hasUserDeclaredMoveAssignment() &&
@@ -932,7 +932,7 @@ public:
   /// assignment operator to be lazily declared.
   bool needsImplicitCopyAssignment() const {
     return !(data().DeclaredSpecialMembers & SMF_CopyAssignment) &&
-           (!getLangOpts().HLSL || isHLSLBuiltinRecord());
+           (!getLangOpts().HLSL || getLangOpts().HLSLCPlusPlus || isHLSLBuiltinRecord());
   }
 
   /// Determine whether we need to eagerly declare a defaulted copy
@@ -991,7 +991,7 @@ public:
   /// this.
   bool needsImplicitMoveAssignment() const {
     return !(data().DeclaredSpecialMembers & SMF_MoveAssignment) &&
-           (!getLangOpts().HLSL || isHLSLBuiltinRecord()) &&
+           (!getLangOpts().HLSL || getLangOpts().HLSLCPlusPlus || isHLSLBuiltinRecord()) &&
            !hasUserDeclaredCopyConstructor() &&
            !hasUserDeclaredCopyAssignment() &&
            !hasUserDeclaredMoveConstructor() &&

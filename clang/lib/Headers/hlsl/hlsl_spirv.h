@@ -25,4 +25,21 @@ using SpirvOpaqueType = __hlsl_spirv_type<Opcode, 0, 0, Operands...>;
 } // namespace vk
 } // namespace hlsl
 
+// SPV_KHR_ray_tracing exposes the zero-based launch coordinates as a uint3.
+inline uint3 DispatchRaysIndex() {
+  return uint3(__builtin_spirv_launch_id(0),
+               __builtin_spirv_launch_id(1),
+               __builtin_spirv_launch_id(2));
+}
+
+// Dispatching tasks terminates the current amplification workgroup. The
+// payload is checked by Sema and lowered to TaskPayloadWorkgroupEXT.
+#ifdef __PROPHET_SHADER_CPP__
+template <typename T>
+void DispatchMesh(uint x, uint y, uint z, groupshared T &payload);
+#else
+__attribute__((clang_builtin_alias(__builtin_hlsl_dispatch_mesh)))
+void DispatchMesh(uint x, uint y, uint z, ...);
+#endif
+
 #endif // _HLSL_HLSL_SPIRV_H_

@@ -18,6 +18,8 @@
 
 // Basic types, type traits and type-independent templates.
 #include "hlsl/hlsl_basic_types.h"
+#include "hlsl/hlsl_geometry.h"
+#include "hlsl/hlsl_patch.h"
 #include "hlsl/hlsl_detail.h"
 
 // HLSL standard library function declarations/definitions.
@@ -30,6 +32,7 @@
 
 #ifdef __spirv__
 #include "hlsl/hlsl_spirv.h"
+#include "hlsl/hlsl_raytracing.h"
 #endif // __spirv__
 
 #if defined(__clang__)

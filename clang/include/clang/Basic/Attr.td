@@ -5110,6 +5110,54 @@ def HLSLNumThreads: InheritableAttr {
   let Documentation = [NumThreadsDocs];
 }
 
+def HLSLMaxVertexCount : InheritableAttr {
+  let Spellings = [Microsoft<"maxvertexcount">];
+  let Args = [IntArgument<"Count">];
+  let Subjects = SubjectList<[HLSLEntry]>;
+  let LangOpts = [HLSL];
+  let Documentation = [Undocumented];
+}
+
+def HLSLTessDomain : InheritableAttr {
+  let Spellings = [Microsoft<"domain">];
+  let Args = [StringArgument<"Domain">];
+  let Subjects = SubjectList<[HLSLEntry]>;
+  let LangOpts = [HLSL];
+  let Documentation = [Undocumented];
+}
+
+def HLSLTessPartitioning : InheritableAttr {
+  let Spellings = [Microsoft<"partitioning">];
+  let Args = [StringArgument<"Partitioning">];
+  let Subjects = SubjectList<[HLSLEntry]>;
+  let LangOpts = [HLSL];
+  let Documentation = [Undocumented];
+}
+
+def HLSLTessOutputTopology : InheritableAttr {
+  let Spellings = [Microsoft<"outputtopology">];
+  let Args = [StringArgument<"Topology">];
+  let Subjects = SubjectList<[HLSLEntry]>;
+  let LangOpts = [HLSL];
+  let Documentation = [Undocumented];
+}
+
+def HLSLTessOutputControlPoints : InheritableAttr {
+  let Spellings = [Microsoft<"outputcontrolpoints">];
+  let Args = [IntArgument<"Count">];
+  let Subjects = SubjectList<[HLSLEntry]>;
+  let LangOpts = [HLSL];
+  let Documentation = [Undocumented];
+}
+
+def HLSLTessPatchConstantFunc : InheritableAttr {
+  let Spellings = [Microsoft<"patchconstantfunc">];
+  let Args = [StringArgument<"Function">];
+  let Subjects = SubjectList<[HLSLEntry]>;
+  let LangOpts = [HLSL];
+  let Documentation = [Undocumented];
+}
+
 def HLSLVkBinding : InheritableAttr {
   let Spellings = [CXX11<"vk", "binding">];
   let Subjects = SubjectList<[HLSLBufferObj, ExternalGlobalVar], ErrorDiag>;
@@ -5319,6 +5367,37 @@ def HLSLGroupSharedAddressSpace : TypeAttr {
   let Spellings = [CustomKeyword<"groupshared">];
   let Subjects = SubjectList<[Var]>;
   let Documentation = [HLSLGroupSharedAddressSpaceDocs];
+}
+
+def HLSLPrecise : InheritableAttr {
+  let Spellings = [CustomKeyword<"precise">];
+  let Subjects = SubjectList<[Var, Field, Function]>;
+  let LangOpts = [HLSL];
+  let SimpleHandler = 1;
+  let Documentation = [Undocumented];
+}
+def HLSLGloballyCoherent : InheritableAttr {
+  let Spellings = [CustomKeyword<"globallycoherent">];
+  let Subjects = SubjectList<[Var, Field]>;
+  let LangOpts = [HLSL];
+  let SimpleHandler = 1;
+  let Documentation = [Undocumented];
+}
+
+def HLSLGeometryInput : InheritableAttr {
+  let Spellings = [CustomKeyword<"point">, CustomKeyword<"line">,
+                   CustomKeyword<"lineadj">, CustomKeyword<"triangle">,
+                   CustomKeyword<"triangleadj">];
+  let Subjects = SubjectList<[ParmVar], ErrorDiag>;
+  let LangOpts = [HLSL];
+  let Documentation = [Undocumented];
+}
+def HLSLMeshParamModifier : InheritableAttr {
+  let Spellings = [CustomKeyword<"vertices">, CustomKeyword<"indices">,
+                   CustomKeyword<"primitives">, CustomKeyword<"payload">];
+  let Subjects = SubjectList<[ParmVar], ErrorDiag>;
+  let LangOpts = [HLSL];
+  let Documentation = [Undocumented];
 }
 
 def HLSLParamModifier : ParameterABIAttr {

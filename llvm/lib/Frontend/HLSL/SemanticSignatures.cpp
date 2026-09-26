@@ -106,6 +106,16 @@ hlsl::getAvailableStages(dxbc::PSV::SemanticKind SemanticKind) {
         {Triple::Pixel, IOType::Out, SemanticInterpretation::Target}};
     return Stages;
   }
+  case dxbc::PSV::SemanticKind::OutputControlPointID: {
+    static constexpr SemanticStageInfo Stages[] = {
+        {Triple::Hull, IOType::In, SemanticInterpretation::NotAllocated}};
+    return Stages;
+  }
+  case dxbc::PSV::SemanticKind::DomainLocation: {
+    static constexpr SemanticStageInfo Stages[] = {
+        {Triple::Domain, IOType::In, SemanticInterpretation::NotAllocated}};
+    return Stages;
+  }
   case dxbc::PSV::SemanticKind::VertexID:
   case dxbc::PSV::SemanticKind::InstanceID: {
     static constexpr SemanticStageInfo Stages[] = {

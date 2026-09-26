@@ -1749,8 +1749,10 @@ ExprResult Sema::ActOnMemberAccessExpr(Scope *S, Expr *Base,
                          NameInfo, TemplateArgs);
 
   bool IsArrow = (OpKind == tok::arrow);
+  if (getLangOpts().HLSLCPlusPlus && isa<CXXThisExpr>(Base->IgnoreParenImpCasts()))
+    IsArrow = true; // HLSL this.member and C++ this->member share one object.
 
-  if (getLangOpts().HLSL && IsArrow)
+  if (getLangOpts().HLSL && !getLangOpts().HLSLCPlusPlus && IsArrow)
     return ExprError(Diag(OpLoc, diag::err_hlsl_operator_unsupported) << 2);
 
   NamedDecl *FirstQualifierInScope
@@ -1934,6 +1936,6 @@ Sema::BuildImplicitMemberExpr(const CXXScopeSpec &SS,
   return BuildMemberReferenceExpr(
       baseExpr, ThisTy,
       /*OpLoc=*/SourceLocation(),
-      /*IsArrow=*/!getLangOpts().HLSL, SS, TemplateKWLoc,
+      /*IsArrow=*/(!getLangOpts().HLSL || getLangOpts().HLSLCPlusPlus), SS, TemplateKWLoc,
       /*FirstQualifierInScope=*/nullptr, R, TemplateArgs, S);
 }

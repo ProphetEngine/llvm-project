@@ -9060,6 +9060,9 @@ def fdefault_calling_conv_EQ : Joined<["-"], "fdefault-calling-conv=">,
   MarshallingInfoEnum<LangOpts<"DefaultCallingConv">, "DCC_None">;
 
 // These options cannot be marshalled, because they are used to set up the LangOptions defaults.
+def fshader_cxx : Flag<["-"], "fshader-c++">,
+  Visibility<[ClangOption, CC1Option]>, Group<f_Group>,
+  HelpText<"Enable HLSL shader types and syntax in a C++ translation unit">;
 def finclude_default_header : Flag<["-"], "finclude-default-header">,
   HelpText<"Include default header file for OpenCL and HLSL">;
 def fdeclare_opencl_builtins : Flag<["-"], "fdeclare-opencl-builtins">,

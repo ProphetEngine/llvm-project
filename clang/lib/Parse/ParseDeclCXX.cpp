@@ -56,7 +56,9 @@ Parser::DeclGroupPtrTy Parser::ParseNamespace(DeclaratorContext Context,
 
   while (MaybeParseGNUAttributes(attrs) || isAllowedCXX11AttributeSpecifier()) {
     if (isAllowedCXX11AttributeSpecifier()) {
-      if (getLangOpts().CPlusPlus11)
+      // Shader composition attributes are valid on HLSL namespaces; this
+      // declaration grammar does not opt HLSL into other C++17 features.
+      if (getLangOpts().CPlusPlus11 && !getLangOpts().HLSL)
         DiagCompat(Tok.getLocation(), diag_compat::ns_enum_attribute)
             << 0 /*namespace*/;
       ParseCXX11Attributes(attrs);
@@ -2589,7 +2591,9 @@ bool Parser::ParseCXXMemberDeclaratorBeforeInitializer(
   if (!IsFunctionDeclarator && !getLangOpts().MSVCCompat)
     MaybeParseGNUAttributes(DeclaratorInfo, &LateParsedAttrs);
 
-  if (getLangOpts().HLSL)
+  if (getLangOpts().HLSL &&
+      (!getLangOpts().HLSLCPlusPlus ||
+       DeclaratorInfo.getName().getKind() != UnqualifiedIdKind::IK_ConstructorName))
     MaybeParseHLSLAnnotations(DeclaratorInfo, nullptr,
                               /*CouldBeBitField*/ true);
 
@@ -3738,7 +3742,8 @@ void Parser::ParseCXXMemberSpecification(SourceLocation RecordLoc,
   // are public by default.
   // HLSL: In HLSL members of a class are public by default.
   AccessSpecifier CurAS;
-  if (TagType == DeclSpec::TST_class && !getLangOpts().HLSL)
+  if (TagType == DeclSpec::TST_class &&
+      (!getLangOpts().HLSL || getLangOpts().HLSLCPlusPlus))
     CurAS = AS_private;
   else
     CurAS = AS_public;
@@ -4977,7 +4982,12 @@ void Parser::ParseMicrosoftAttributes(ParsedAttributes &Attrs) {
   SourceLocation StartLoc = Tok.getLocation();
   SourceLocation EndLoc = StartLoc;
   do {
-    // FIXME: If this is actually a C++11 attribute, parse it as one.
+    // HLSL [attributes] and C++ [[attributes]] can be interleaved.
+    // Preserve the C++ scope and spelling instead of treating it as Microsoft.
+    if (NextToken().is(tok::l_square)) {
+      ParseCXX11AttributeSpecifier(Attrs, &EndLoc);
+      continue;
+    }
     BalancedDelimiterTracker T(*this, tok::l_square);
     T.consumeOpen();
 

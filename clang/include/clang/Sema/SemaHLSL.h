@@ -136,6 +136,10 @@ public:
   void ActOnEndOfTranslationUnit(TranslationUnitDecl *TU);
   bool ActOnResourceMemberAccessExpr(MemberExpr *ME);
   void CheckEntryPoint(FunctionDecl *FD);
+  void CheckGeometryEntryPoint(FunctionDecl *FD);
+  void CheckHullEntryPoint(FunctionDecl *FD);
+  void CheckDomainEntryPoint(FunctionDecl *FD);
+  void CheckMeshEntryPoint(FunctionDecl *FD);
 
   // Return true if everything is ok; returns false if there was an error.
   bool CheckResourceBinOp(BinaryOperatorKind Opc, Expr *LHSExpr, Expr *RHSExpr,
@@ -183,6 +187,12 @@ public:
   handleRootSignatureElements(ArrayRef<hlsl::RootSignatureElement> Elements);
   void handleRootSignatureAttr(Decl *D, const ParsedAttr &AL);
   void handleNumThreadsAttr(Decl *D, const ParsedAttr &AL);
+  void handleMaxVertexCountAttr(Decl *D, const ParsedAttr &AL);
+  void handleTessDomainAttr(Decl *D, const ParsedAttr &AL);
+  void handleTessPartitioningAttr(Decl *D, const ParsedAttr &AL);
+  void handleTessOutputTopologyAttr(Decl *D, const ParsedAttr &AL);
+  void handleTessOutputControlPointsAttr(Decl *D, const ParsedAttr &AL);
+  void handleTessPatchConstantFuncAttr(Decl *D, const ParsedAttr &AL);
   void handleWaveSizeAttr(Decl *D, const ParsedAttr &AL);
   void handleVkConstantIdAttr(Decl *D, const ParsedAttr &AL);
   void handleVkBindingAttr(Decl *D, const ParsedAttr &AL);

@@ -8242,6 +8242,29 @@ ProcessDeclAttribute(Sema &S, Decl *D, const ParsedAttr &AL,
   case ParsedAttr::AT_HLSLNumThreads:
     S.HLSL().handleNumThreadsAttr(D, AL);
     break;
+  case ParsedAttr::AT_HLSLMaxVertexCount:
+    S.HLSL().handleMaxVertexCountAttr(D, AL);
+    break;
+  case ParsedAttr::AT_HLSLTessDomain:
+    S.HLSL().handleTessDomainAttr(D, AL);
+    break;
+  case ParsedAttr::AT_HLSLTessPartitioning:
+    S.HLSL().handleTessPartitioningAttr(D, AL);
+    break;
+  case ParsedAttr::AT_HLSLTessOutputTopology:
+    S.HLSL().handleTessOutputTopologyAttr(D, AL);
+    break;
+  case ParsedAttr::AT_HLSLTessOutputControlPoints:
+    S.HLSL().handleTessOutputControlPointsAttr(D, AL);
+    break;
+  case ParsedAttr::AT_HLSLTessPatchConstantFunc:
+    S.HLSL().handleTessPatchConstantFuncAttr(D, AL);
+    break;
+  case ParsedAttr::AT_HLSLGeometryInput:
+    handleSimpleAttribute<HLSLGeometryInputAttr>(S, D, AL);
+    break;  case ParsedAttr::AT_HLSLMeshParamModifier:
+    handleSimpleAttribute<HLSLMeshParamModifierAttr>(S, D, AL);
+    break;
   case ParsedAttr::AT_HLSLWaveSize:
     S.HLSL().handleWaveSizeAttr(D, AL);
     break;

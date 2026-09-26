@@ -13726,6 +13726,42 @@ def err_hlsl_entry_shader_attr_mismatch : Error<
 def err_hlsl_numthreads_argument_oor : Error<"argument '%select{X|Y|Z}0' to numthreads attribute cannot exceed %1">;
 def err_hlsl_numthreads_invalid : Error<"total number of threads cannot exceed %0">;
 def err_hlsl_missing_numthreads : Error<"missing numthreads attribute for %0 shader entry">;
+def err_hlsl_geometry_maxvertexcount_range : Error<
+  "maxvertexcount must be between 1 and 1024">;
+def err_hlsl_geometry_missing_maxvertexcount : Error<
+  "geometry shader entry requires a maxvertexcount attribute">;
+def err_hlsl_geometry_entry_signature : Error<
+  "geometry shader entry requires one primitive array input and one inout geometry stream output">;
+def err_hlsl_geometry_input_type : Error<
+  "%0 input must be an array of exactly %1 records">;
+def err_hlsl_geometry_stream_type : Error<
+  "geometry output must be an inout PointStream, LineStream, or TriangleStream of a record type">;
+def err_hlsl_tess_invalid_attribute_value : Error<
+  "unsupported value '%1' for HLSL attribute %0">;
+def err_hlsl_tess_control_point_count_range : Error<
+  "outputcontrolpoints must be between 1 and 32">;
+def err_hlsl_tess_missing_attribute : Error<
+  "tessellation shader entry requires a %0 attribute">;
+def err_hlsl_tess_entry_signature : Error<
+  "invalid hull or domain shader entry signature">;
+def err_hlsl_tess_patch_constant_function : Error<
+  "patchconstantfunc must name a defined function returning patch constants">;
+def err_hlsl_tess_patch_factor_shape : Error<
+  "invalid SV_TessFactor or SV_InsideTessFactor shape for %0 domain">;
+def err_hlsl_geometry_void_return : Error<
+  "geometry shader entry must return void">;
+def err_hlsl_mesh_missing_topology : Error<
+  "mesh shader entry requires an outputtopology attribute">;
+def err_hlsl_mesh_entry_signature : Error<
+  "mesh shader entry requires out vertices T[N] and out indices uint3[M] parameters">;
+def err_hlsl_mesh_output_type : Error<
+  "mesh %0 output must be a nonempty constant-size array of %1">;
+def err_hlsl_mesh_payload_type : Error<
+  "mesh payload input must be an in payload record parameter">;
+def err_hlsl_dispatch_mesh_stage : Error<
+  "dispatch mesh is only available in an amplification shader">;
+def err_hlsl_dispatch_mesh_payload : Error<
+  "dispatch mesh requires a global groupshared record payload">;
 def err_hlsl_attribute_param_mismatch : Error<"%0 attribute parameters do not match the previous declaration">;
 def err_hlsl_duplicate_parameter_modifier : Error<"duplicate parameter modifier %0">;
 def err_hlsl_missing_semantic_annotation : Error<

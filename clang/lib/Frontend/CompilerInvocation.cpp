@@ -4020,6 +4020,7 @@ void CompilerInvocationBase::GenerateLangArgs(const LangOptions &Opts,
     StringRef S = llvm::getAllocTokenModeAsString(*Opts.AllocTokenMode);
     GenerateArg(Consumer, OPT_falloc_token_mode_EQ, S);
   }
+  if (Opts.HLSLCPlusPlus) GenerateArg(Consumer, OPT_fshader_cxx);
   // Generate args for matrix types.
   if (Opts.MatrixTypes) {
     if (Opts.getDefaultMatrixMemoryLayout() ==
@@ -4129,7 +4130,11 @@ bool CompilerInvocation::ParseLangArgs(LangOptions &Opts, ArgList &Args,
   }
 
   // These need to be parsed now. They are used to set OpenCL defaults.
-  Opts.IncludeDefaultHeader = Args.hasArg(OPT_finclude_default_header);
+  Opts.HLSLCPlusPlus = Args.hasArg(OPT_fshader_cxx);
+  if (Opts.HLSLCPlusPlus && IK.getLanguage() != Language::CXX)
+    Diags.Report(diag::err_drv_argument_not_allowed_with)
+        << "-fshader-c++" << GetInputKindName(IK);
+  Opts.IncludeDefaultHeader = Args.hasArg(OPT_finclude_default_header) || Opts.HLSLCPlusPlus;
   Opts.DeclareOpenCLBuiltins = Args.hasArg(OPT_fdeclare_opencl_builtins);
 
   LangOptions::setLangDefaults(Opts, IK.getLanguage(), T, Includes, LangStd);
@@ -4142,6 +4147,8 @@ bool CompilerInvocation::ParseLangArgs(LangOptions &Opts, ArgList &Args,
   PARSE_OPTION_WITH_MARSHALLING(Args, Diags, __VA_ARGS__)
 #include "clang/Options/Options.inc"
 #undef LANG_OPTION_WITH_MARSHALLING
+
+  if (Opts.HLSLCPlusPlus) Opts.NativeInt16Type = true;
 
   // "Modules semantics" (e.g. cross-translation-unit declaration merging) are
   // needed for both Clang (header) modules and C++20 modules, so enable them
@@ -4688,7 +4695,7 @@ bool CompilerInvocation::ParseLangArgs(LangOptions &Opts, ArgList &Args,
             Args.getLastArg(OPT_fnative_int16_type)) {
           const LangStandard &Std =
               LangStandard::getLangStandardForKind(Opts.LangStd);
-          if (!(Opts.LangStd >= LangStandard::lang_hlsl2018 &&
+          if (!(Opts.getHLSLVersion() >= LangOptions::HLSL_2018 &&
                 T.getOSVersion() >= VersionTuple(6, 2)))
             Diags.Report(diag::err_drv_hlsl_16bit_types_unsupported)
                 << "-enable-16bit-types" << true << Std.getName()
@@ -4706,7 +4713,7 @@ bool CompilerInvocation::ParseLangArgs(LangOptions &Opts, ArgList &Args,
                                 : "-fnative-int16-type";
           const LangStandard &Std =
               LangStandard::getLangStandardForKind(Opts.LangStd);
-          if (!(Opts.LangStd >= LangStandard::lang_hlsl2018))
+          if (!(Opts.getHLSLVersion() >= LangOptions::HLSL_2018))
             Diags.Report(diag::err_drv_hlsl_16bit_types_unsupported)
                 << Str << false << Std.getName();
         }
@@ -4716,7 +4723,7 @@ bool CompilerInvocation::ParseLangArgs(LangOptions &Opts, ArgList &Args,
     } else
       Diags.Report(diag::err_drv_hlsl_unsupported_target) << T.str();
 
-    if (Opts.LangStd < LangStandard::lang_hlsl202x) {
+    if (!Opts.HLSLCPlusPlus && Opts.LangStd < LangStandard::lang_hlsl202x) {
       const LangStandard &Requested =
           LangStandard::getLangStandardForKind(Opts.LangStd);
       const LangStandard &Recommended =

@@ -2,6 +2,11 @@ create_subdirectory_options(CLANG TOOL)
 
 add_clang_subdirectory(diagtool)
 add_clang_subdirectory(driver)
+option(PROPHET_ENABLE_SHADER_COMPILER
+  "Build the ProphetEngine in-process Clang shader compiler DLL" OFF)
+if(PROPHET_ENABLE_SHADER_COMPILER)
+  add_clang_subdirectory(prophet-shader-compiler)
+endif()
 if(CLANG_ENABLE_CIR)
   add_clang_subdirectory(cir-opt)
   add_clang_subdirectory(cir-translate)

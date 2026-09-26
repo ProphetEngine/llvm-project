@@ -1265,7 +1265,8 @@ Sema::CXXThisScopeRAII::CXXThisScopeRAII(Sema &S,
   T = S.getASTContext().getQualifiedType(T, CXXThisTypeQuals);
 
   S.CXXThisTypeOverride =
-      S.Context.getLangOpts().HLSL ? T : S.Context.getPointerType(T);
+      (S.Context.getLangOpts().HLSL && !S.Context.getLangOpts().HLSLCPlusPlus)
+          ? T : S.Context.getPointerType(T);
 
   this->Enabled = true;
 }

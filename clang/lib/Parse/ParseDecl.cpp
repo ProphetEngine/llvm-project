@@ -1093,8 +1093,13 @@ void Parser::ParseOpenCLQualifiers(ParsedAttributes &Attrs) {
 }
 
 bool Parser::isHLSLQualifier(const Token &Tok) const {
-  return Tok.is(tok::kw_groupshared) || Tok.is(tok::kw_row_major) ||
-         Tok.is(tok::kw_column_major);
+  return Tok.is(tok::kw_precise) || Tok.is(tok::kw_globallycoherent) ||
+         Tok.is(tok::kw_groupshared) || Tok.is(tok::kw_row_major) ||
+         Tok.is(tok::kw_column_major) || Tok.is(tok::kw_point) ||
+         Tok.is(tok::kw_line) || Tok.is(tok::kw_lineadj) ||
+         Tok.is(tok::kw_triangle) || Tok.is(tok::kw_triangleadj) ||
+         Tok.is(tok::kw_vertices) || Tok.is(tok::kw_indices) ||
+         Tok.is(tok::kw_primitives) || Tok.is(tok::kw_payload);
 }
 
 void Parser::ParseHLSLQualifiers(ParsedAttributes &Attrs) {
@@ -2182,7 +2187,8 @@ Parser::DeclGroupPtrTy Parser::ParseDeclGroup(ParsingDeclSpec &DS,
     return nullptr;
   }
 
-  if (getLangOpts().HLSL)
+  if (getLangOpts().HLSL &&
+      (!getLangOpts().HLSLCPlusPlus || D.getContext() != DeclaratorContext::ForInit))
     while (MaybeParseHLSLAnnotations(D))
       ;
 
@@ -2433,7 +2439,8 @@ Parser::DeclGroupPtrTy Parser::ParseDeclGroup(ParsingDeclSpec &DS,
 
     ParseDeclarator(D);
 
-    if (getLangOpts().HLSL)
+    if (getLangOpts().HLSL &&
+      (!getLangOpts().HLSLCPlusPlus || D.getContext() != DeclaratorContext::ForInit))
       MaybeParseHLSLAnnotations(D);
 
     if (!D.isInvalidType()) {
@@ -4657,11 +4664,28 @@ void Parser::ParseDeclarationSpecifiers(
       break;
     case tok::kw_row_major:
     case tok::kw_column_major:
+    case tok::kw_precise:
+    case tok::kw_globallycoherent:
     case tok::kw_groupshared:
     case tok::kw_in:
     case tok::kw_inout:
     case tok::kw_out:
+    case tok::kw_point:
+    case tok::kw_line:
+    case tok::kw_lineadj:
+    case tok::kw_triangle:
+    case tok::kw_triangleadj:
       // NOTE: ParseHLSLQualifiers will consume the qualifier token.
+      ParseHLSLQualifiers(DS.getAttributes());
+      continue;
+    case tok::kw_vertices:
+    case tok::kw_indices:
+    case tok::kw_primitives:
+    case tok::kw_payload:
+      if (DS.hasTypeSpecifier()) {
+        Tok.setKind(tok::identifier);
+        goto DoneWithDeclSpec;
+      }
       ParseHLSLQualifiers(DS.getAttributes());
       continue;
 
@@ -5771,12 +5795,23 @@ bool Parser::isTypeSpecifierQualifier(const Token &Tok) {
     return true;
 
   // HLSL type qualifiers
-  case tok::kw_groupshared:
+  case tok::kw_precise:
+    case tok::kw_globallycoherent:
+    case tok::kw_groupshared:
   case tok::kw_in:
   case tok::kw_inout:
   case tok::kw_out:
   case tok::kw_row_major:
   case tok::kw_column_major:
+  case tok::kw_point:
+  case tok::kw_line:
+  case tok::kw_lineadj:
+  case tok::kw_triangle:
+  case tok::kw_triangleadj:
+  case tok::kw_vertices:
+  case tok::kw_indices:
+  case tok::kw_primitives:
+  case tok::kw_payload:
     return getLangOpts().HLSL;
   }
 }
@@ -6052,11 +6087,22 @@ bool Parser::isDeclarationSpecifier(
 #include "clang/Basic/HLSLIntangibleTypes.def"
 
   case tok::kw___funcref:
-  case tok::kw_groupshared:
+  case tok::kw_precise:
+    case tok::kw_globallycoherent:
+    case tok::kw_groupshared:
     return true;
 
   case tok::kw_row_major:
   case tok::kw_column_major:
+  case tok::kw_point:
+  case tok::kw_line:
+  case tok::kw_lineadj:
+  case tok::kw_triangle:
+  case tok::kw_triangleadj:
+  case tok::kw_vertices:
+  case tok::kw_indices:
+  case tok::kw_primitives:
+  case tok::kw_payload:
     return getLangOpts().HLSL;
 
   case tok::kw_private:
@@ -6297,13 +6343,28 @@ void Parser::ParseTypeQualifierListOpt(
       ParseOpenCLQualifiers(DS.getAttributes());
       break;
 
+    case tok::kw_precise:
+    case tok::kw_globallycoherent:
     case tok::kw_groupshared:
     case tok::kw_in:
     case tok::kw_inout:
     case tok::kw_out:
+    case tok::kw_point:
+    case tok::kw_line:
+    case tok::kw_lineadj:
+    case tok::kw_triangle:
+    case tok::kw_triangleadj:
       // NOTE: ParseHLSLQualifiers will consume the qualifier token.
       ParseHLSLQualifiers(DS.getAttributes());
       continue;
+    case tok::kw_vertices:
+    case tok::kw_indices:
+    case tok::kw_primitives:
+    case tok::kw_payload:
+      // After a pointer/reference operator these contextual tokens name the
+      // declarator. They cannot introduce a mesh parameter modifier here.
+      Tok.setKind(tok::identifier);
+      goto DoneWithTypeQuals;
 
     // __ptrauth qualifier.
     case tok::kw___ptrauth:

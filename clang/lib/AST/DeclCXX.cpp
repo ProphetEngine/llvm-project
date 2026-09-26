@@ -1501,7 +1501,7 @@ void CXXRecordDecl::addedMember(Decl *D) {
   // relevant HLSL feature proposals that will depend on this changing:
   // * 0005-strict-initializer-lists.md
   // * https://github.com/microsoft/hlsl-specs/pull/325
-  if (getLangOpts().HLSL)
+  if (getLangOpts().HLSL && !getLangOpts().HLSLCPlusPlus)
     data().Aggregate = data().UserDeclaredSpecialMembers == 0;
 }
 
@@ -2848,7 +2848,7 @@ QualType CXXMethodDecl::getThisType(const FunctionProtoType *FPT,
   if (Restrict)
     ObjectTy.removeLocalRestrict();
 
-  ObjectTy = C.getLangOpts().HLSL ? C.getLValueReferenceType(ObjectTy)
+  ObjectTy = (C.getLangOpts().HLSL && !C.getLangOpts().HLSLCPlusPlus) ? C.getLValueReferenceType(ObjectTy)
                                   : C.getPointerType(ObjectTy);
 
   if (Restrict)

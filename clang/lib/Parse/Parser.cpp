@@ -1069,7 +1069,10 @@ Parser::DeclGroupPtrTy Parser::ParseDeclOrFunctionDefInternal(
   DS.takeAttributesAppendingingFrom(DeclSpecAttrs);
 
   ParsedTemplateInfo TemplateInfo;
-  MaybeParseMicrosoftAttributes(DS.getAttributes());
+  // Leading HLSL and C++ attributes describe the declaration. Keeping an
+  // interleaved [[attribute]] on DeclSpec would instead treat it as a type
+  // attribute and discard it before creating the function declaration.
+  MaybeParseMicrosoftAttributes(getLangOpts().HLSL ? Attrs : DS.getAttributes());
   // Parse the common declaration-specifiers piece.
   ParseDeclarationSpecifiers(DS, TemplateInfo, AS,
                              DeclSpecContext::DSC_top_level);

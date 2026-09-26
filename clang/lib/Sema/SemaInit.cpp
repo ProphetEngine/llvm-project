@@ -6950,7 +6950,7 @@ void InitializationSequence::InitializeFrom(Sema &S,
   //       (except for HLSL, where user-defined record types do not have
   //        constructors or conversion functions)
   if (DestType->isRecordType() &&
-      (!S.getLangOpts().HLSL ||
+      (!S.getLangOpts().HLSL || S.getLangOpts().HLSLCPlusPlus ||
        DestType->getAsCXXRecordDecl()->isHLSLBuiltinRecord())) {
     //     - If the initialization is direct-initialization, or if it is
     //       copy-initialization where the cv-unqualified version of the
@@ -7039,7 +7039,7 @@ void InitializationSequence::InitializeFrom(Sema &S,
   //      (except for HLSL, where user-defined record types do not have
   //      constructors or conversion functions).
   if (!SourceType.isNull() && SourceType->isRecordType() &&
-      (!S.getLangOpts().HLSL ||
+      (!S.getLangOpts().HLSL || S.getLangOpts().HLSLCPlusPlus ||
        SourceType->getAsCXXRecordDecl()->isHLSLBuiltinRecord())) {
     assert(Initializer && "Initializer must be non-null");
     // For a conversion to _Atomic(T) from either T or a class type derived

@@ -397,6 +397,10 @@ static void InitializeStandardPredefinedMacros(const TargetInfo &TI,
                                                const LangOptions &LangOpts,
                                                const FrontendOptions &FEOpts,
                                                MacroBuilder &Builder) {
+  if (LangOpts.HLSLCPlusPlus) {
+    Builder.defineMacro("__PROPHET_SHADER_CPP__", "1");
+    Builder.defineMacro("__PROPHET_SHADER_LANGUAGE_CONTRACT__", "2");
+  }
   if (LangOpts.HLSL) {
     Builder.defineMacro("__hlsl_clang");
     // HLSL Version
@@ -442,7 +446,7 @@ static void InitializeStandardPredefinedMacros(const TargetInfo &TI,
       unsigned Minor = Version.getMinor().value_or(0);
       Builder.defineMacro("__SHADER_TARGET_MINOR", Twine(Minor));
     }
-    return;
+    if (!LangOpts.HLSLCPlusPlus) return;
   }
   // C++ [cpp.predefined]p1:
   //   The following macro names shall be defined by the implementation:

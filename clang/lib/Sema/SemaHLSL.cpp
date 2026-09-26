@@ -15,6 +15,7 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclBase.h"
 #include "clang/AST/DeclCXX.h"
+#include "clang/AST/DeclTemplate.h"
 #include "clang/AST/DeclarationName.h"
 #include "clang/AST/DynamicRecursiveASTVisitor.h"
 #include "clang/AST/Expr.h"
@@ -887,6 +888,8 @@ static bool isVkPipelineBuiltin(const ASTContext &AstContext, FunctionDecl *FD,
     return true;
   case SemanticKind::InstanceID:
     return ST == llvm::Triple::Vertex && IsInput;
+  case SemanticKind::IsFrontFace:
+    return ST == llvm::Triple::Pixel && IsInput;
   default:
     return false;
   }
@@ -987,6 +990,469 @@ bool SemaHLSL::determineActiveSemantic(FunctionDecl *FD,
   return true;
 }
 
+static const ClassTemplateSpecializationDecl *
+getTessPatchSpecialization(QualType Type, StringRef QualifiedName) {
+  const auto *Specialization = dyn_cast_or_null<ClassTemplateSpecializationDecl>(
+      Type.getNonReferenceType()->getAsCXXRecordDecl());
+  if (!Specialization ||
+      Specialization->getSpecializedTemplate()->getQualifiedNameAsString() !=
+          QualifiedName ||
+      Specialization->getTemplateArgs().size() != 2 ||
+      Specialization->getTemplateArgs()[0].getKind() != TemplateArgument::Type ||
+      Specialization->getTemplateArgs()[1].getKind() !=
+          TemplateArgument::Integral)
+    return nullptr;
+  return Specialization;
+}
+
+static bool hasValidTessFactorShape(ASTContext &Context,
+                                    const RecordDecl *Record,
+                                    StringRef Domain, bool RequireFactors) {
+  unsigned EdgeCount = Domain == "tri" ? 3 : Domain == "quad" ? 4 : 2;
+  unsigned InnerCount = Domain == "quad" ? 2 : Domain == "tri" ? 1 : 0;
+  bool HasEdges = false;
+  bool HasInner = false;
+  for (const FieldDecl *Field : Record->fields()) {
+    const auto *Semantic = Field->getAttr<HLSLParsedSemanticAttr>();
+    if (!Semantic)
+      continue;
+    SemanticKind Kind =
+        llvm::hlsl::getSemanticKind(Semantic->getSemanticName());
+    if (Kind == SemanticKind::TessFactor) {
+      const auto *Array = Context.getAsConstantArrayType(Field->getType());
+      if (HasEdges || !Array || Array->getSize().getZExtValue() != EdgeCount ||
+          !Array->getElementType()->isSpecificBuiltinType(BuiltinType::Float))
+        return false;
+      HasEdges = true;
+    } else if (Kind == SemanticKind::InsideTessFactor) {
+      if (HasInner || InnerCount == 0)
+        return false;
+      const auto *Array = Context.getAsConstantArrayType(Field->getType());
+      if (InnerCount == 1) {
+        if (Array || !Field->getType()->isSpecificBuiltinType(BuiltinType::Float))
+          return false;
+      } else if (!Array || Array->getSize().getZExtValue() != InnerCount ||
+                 !Array->getElementType()->isSpecificBuiltinType(
+                     BuiltinType::Float)) {
+        return false;
+      }
+      HasInner = true;
+    }
+  }
+  return !RequireFactors || (HasEdges && (InnerCount == 0 || HasInner));
+}
+void SemaHLSL::CheckHullEntryPoint(FunctionDecl *FD) {
+  bool Invalid = false;
+  if (!FD->hasAttr<HLSLTessDomainAttr>() ||
+      !FD->hasAttr<HLSLTessPartitioningAttr>() ||
+      !FD->hasAttr<HLSLTessOutputTopologyAttr>() ||
+      !FD->hasAttr<HLSLTessOutputControlPointsAttr>() ||
+      !FD->hasAttr<HLSLTessPatchConstantFuncAttr>()) {
+    if (!FD->hasAttr<HLSLTessDomainAttr>())
+      Diag(FD->getLocation(), diag::err_hlsl_tess_missing_attribute)
+          << "domain";
+    if (!FD->hasAttr<HLSLTessPartitioningAttr>())
+      Diag(FD->getLocation(), diag::err_hlsl_tess_missing_attribute)
+          << "partitioning";
+    if (!FD->hasAttr<HLSLTessOutputTopologyAttr>())
+      Diag(FD->getLocation(), diag::err_hlsl_tess_missing_attribute)
+          << "outputtopology";
+    if (!FD->hasAttr<HLSLTessOutputControlPointsAttr>())
+      Diag(FD->getLocation(), diag::err_hlsl_tess_missing_attribute)
+          << "outputcontrolpoints";
+    if (!FD->hasAttr<HLSLTessPatchConstantFuncAttr>())
+      Diag(FD->getLocation(), diag::err_hlsl_tess_missing_attribute)
+          << "patchconstantfunc";
+    Invalid = true;
+  }
+  if (FD->getNumParams() != 2 || !FD->getReturnType()->isRecordType()) {
+    Diag(FD->getLocation(), diag::err_hlsl_tess_entry_signature);
+    FD->setInvalidDecl();
+    return;
+  }
+  ParmVarDecl *Input = FD->getParamDecl(0);
+  ParmVarDecl *ControlPointID = FD->getParamDecl(1);
+  const auto *Patch =
+      getTessPatchSpecialization(Input->getType(), "hlsl::InputPatch");
+  const RecordDecl *InputRecord =
+      Patch ? Patch->getTemplateArgs()[0].getAsType()->getAsRecordDecl()
+            : nullptr;
+  unsigned InputCount =
+      Patch ? Patch->getTemplateArgs()[1].getAsIntegral().getZExtValue() : 0;
+  if (!InputRecord || !InputRecord->getDefinition() || InputCount == 0 ||
+      InputCount > 32 ||
+      llvm::hlsl::getSemanticKind(
+          ControlPointID->getAttr<HLSLParsedSemanticAttr>()
+              ? ControlPointID->getAttr<HLSLParsedSemanticAttr>()
+                    ->getSemanticName()
+              : StringRef()) != SemanticKind::OutputControlPointID) {
+    Diag(FD->getLocation(), diag::err_hlsl_tess_entry_signature);
+    Invalid = true;
+  }
+  if (Invalid) {
+    FD->setInvalidDecl();
+    return;
+  }
+
+  FunctionDecl *PatchFunction = nullptr;
+  StringRef PatchName = FD->getAttr<HLSLTessPatchConstantFuncAttr>()
+                            ->getFunction();
+  for (Decl *D : FD->getDeclContext()->decls())
+    if (auto *Candidate = dyn_cast<FunctionDecl>(D))
+      if (Candidate->getName() == PatchName && Candidate->hasBody() &&
+          Candidate->getReturnType()->isRecordType()) {
+        PatchFunction = Candidate;
+        break;
+      }
+  if (!PatchFunction || PatchFunction->getNumParams() != 1 ||
+      !getTessPatchSpecialization(PatchFunction->getParamDecl(0)->getType(),
+                                  "hlsl::InputPatch") ||
+      !SemaRef.Context.hasSameType(
+          PatchFunction->getParamDecl(0)->getType()
+              .getNonReferenceType().getUnqualifiedType(),
+          Input->getType().getNonReferenceType().getUnqualifiedType())) {
+    Diag(FD->getLocation(), diag::err_hlsl_tess_patch_constant_function);
+    FD->setInvalidDecl();
+    return;
+  }
+  StringRef Domain = FD->getAttr<HLSLTessDomainAttr>()->getDomain();
+  if (!hasValidTessFactorShape(
+          SemaRef.Context, PatchFunction->getReturnType()->getAsRecordDecl(),
+          Domain, /* RequireFactors */ true)) {
+    Diag(FD->getLocation(), diag::err_hlsl_tess_patch_factor_shape) << Domain;
+    FD->setInvalidDecl();
+    return;
+  }
+
+  SemanticContext InputSC = {};
+  InputSC.CurrentIOType = IOType::In;
+  for (FieldDecl *Field : InputRecord->fields()) {
+    SemanticInfo Info = {};
+    if (!determineActiveSemantic(FD, Input, Field, Info, InputSC))
+      Invalid = true;
+  }
+  SemanticInfo IDInfo = {};
+  if (!determineActiveSemantic(FD, ControlPointID, ControlPointID, IDInfo,
+                               InputSC))
+    Invalid = true;
+  SemanticContext OutputSC = {};
+  OutputSC.CurrentIOType = IOType::Out;
+  SemanticInfo ReturnInfo = {};
+  if (!determineActiveSemantic(FD, FD, FD, ReturnInfo, OutputSC))
+    Invalid = true;
+
+  SemanticContext PatchSC = {};
+  PatchSC.CurrentIOType = IOType::PatchConstantOrPrimitive;
+  for (FieldDecl *Field :
+       PatchFunction->getReturnType()->getAsRecordDecl()->fields()) {
+    SemanticInfo Info = {};
+    if (!determineActiveSemantic(FD, PatchFunction, Field, Info, PatchSC))
+      Invalid = true;
+  }
+  if (Invalid)
+    FD->setInvalidDecl();
+}
+
+void SemaHLSL::CheckDomainEntryPoint(FunctionDecl *FD) {
+  if (!FD->hasAttr<HLSLTessDomainAttr>()) {
+    Diag(FD->getLocation(), diag::err_hlsl_tess_missing_attribute) << "domain";
+    FD->setInvalidDecl();
+    return;
+  }
+  if (FD->getNumParams() != 3 || FD->getReturnType()->isVoidType()) {
+    Diag(FD->getLocation(), diag::err_hlsl_tess_entry_signature);
+    FD->setInvalidDecl();
+    return;
+  }
+  ParmVarDecl *Factors = FD->getParamDecl(0);
+  ParmVarDecl *Coordinates = FD->getParamDecl(1);
+  ParmVarDecl *Input = FD->getParamDecl(2);
+  const auto *Patch =
+      getTessPatchSpecialization(Input->getType(), "hlsl::OutputPatch");
+  const RecordDecl *InputRecord =
+      Patch ? Patch->getTemplateArgs()[0].getAsType()->getAsRecordDecl()
+            : nullptr;
+  unsigned InputCount =
+      Patch ? Patch->getTemplateArgs()[1].getAsIntegral().getZExtValue() : 0;
+  if (!Factors->getType()->isRecordType() || !InputRecord ||
+      !InputRecord->getDefinition() || InputCount == 0 || InputCount > 32 ||
+      llvm::hlsl::getSemanticKind(
+          Coordinates->getAttr<HLSLParsedSemanticAttr>()
+              ? Coordinates->getAttr<HLSLParsedSemanticAttr>()
+                    ->getSemanticName()
+              : StringRef()) != SemanticKind::DomainLocation) {
+    Diag(FD->getLocation(), diag::err_hlsl_tess_entry_signature);
+    FD->setInvalidDecl();
+    return;
+  }
+  StringRef Domain = FD->getAttr<HLSLTessDomainAttr>()->getDomain();
+  const auto *CoordinateType = Coordinates->getType()->getAs<VectorType>();
+  unsigned CoordinateCount = Domain == "tri" ? 3 : 2;
+  if (!CoordinateType ||
+      CoordinateType->getNumElements() != CoordinateCount ||
+      !CoordinateType->getElementType()->isSpecificBuiltinType(
+          BuiltinType::Float)) {
+    Diag(FD->getLocation(), diag::err_hlsl_tess_entry_signature);
+    FD->setInvalidDecl();
+    return;
+  }
+  if (!hasValidTessFactorShape(SemaRef.Context,
+                               Factors->getType()->getAsRecordDecl(), Domain,
+                               /* RequireFactors */ false)) {
+    Diag(FD->getLocation(), diag::err_hlsl_tess_patch_factor_shape) << Domain;
+    FD->setInvalidDecl();
+    return;
+  }
+  bool Invalid = false;
+  SemanticContext PatchSC = {};
+  PatchSC.CurrentIOType = IOType::PatchConstantOrPrimitive;
+  for (FieldDecl *Field : Factors->getType()->getAsRecordDecl()->fields()) {
+    SemanticInfo Info = {};
+    if (!determineActiveSemantic(FD, Factors, Field, Info, PatchSC))
+      Invalid = true;
+  }
+  SemanticContext InputSC = {};
+  InputSC.CurrentIOType = IOType::In;
+  SemanticInfo CoordInfo = {};
+  if (!determineActiveSemantic(FD, Coordinates, Coordinates, CoordInfo,
+                               InputSC))
+    Invalid = true;
+  for (FieldDecl *Field : InputRecord->fields()) {
+    SemanticInfo Info = {};
+    if (!determineActiveSemantic(FD, Input, Field, Info, InputSC))
+      Invalid = true;
+  }
+  SemanticContext OutputSC = {};
+  OutputSC.CurrentIOType = IOType::Out;
+  SemanticInfo ReturnInfo = {};
+  if (!determineActiveSemantic(FD, FD, FD, ReturnInfo, OutputSC))
+    Invalid = true;
+  if (Invalid)
+    FD->setInvalidDecl();
+}
+
+void SemaHLSL::CheckMeshEntryPoint(FunctionDecl *FD) {
+  bool Invalid = false;
+  const auto *Topology = FD->getAttr<HLSLTessOutputTopologyAttr>();
+  if (!Topology) {
+    Diag(FD->getLocation(), diag::err_hlsl_mesh_missing_topology);
+    Invalid = true;
+  } else if (Topology->getTopology() != "triangle") {
+    Diag(Topology->getLocation(), diag::err_hlsl_tess_invalid_attribute_value)
+        << Topology << Topology->getTopology();
+    Invalid = true;
+  }
+  if (!FD->getReturnType()->isVoidType() ||
+      (FD->getNumParams() < 2 || FD->getNumParams() > 4)) {
+    Diag(FD->getLocation(), diag::err_hlsl_mesh_entry_signature);
+    FD->setInvalidDecl();
+    return;
+  }
+  ParmVarDecl *Vertices = nullptr;
+  ParmVarDecl *Indices = nullptr;
+  ParmVarDecl *Primitives = nullptr;
+  ParmVarDecl *Payload = nullptr;
+  for (ParmVarDecl *Param : FD->parameters()) {
+    const auto *MeshAttr = Param->getAttr<HLSLMeshParamModifierAttr>();
+    const auto *Direction = Param->getAttr<HLSLParamModifierAttr>();
+    StringRef Kind = MeshAttr ? MeshAttr->getSpelling() : "";
+    if (Kind == "payload") {
+      if (Payload || !Direction || !Direction->isIn() ||
+          !Param->getOriginalType()->isRecordType()) {
+        Diag(Param->getLocation(), diag::err_hlsl_mesh_payload_type);
+        Invalid = true;
+      } else {
+        Payload = Param;
+      }
+      continue;
+    }
+    if (!Direction || !Direction->isOut()) {
+      Diag(Param->getLocation(), diag::err_hlsl_mesh_entry_signature);
+      Invalid = true;
+    }
+    if (Kind == "vertices" && !Vertices)
+      Vertices = Param;
+    else if (Kind == "indices" && !Indices)
+      Indices = Param;
+    else if (Kind == "primitives" && !Primitives)
+      Primitives = Param;
+    else {
+      Diag(Param->getLocation(), diag::err_hlsl_mesh_entry_signature);
+      Invalid = true;
+    }
+  }
+  if (!Vertices || !Indices ||
+      FD->getNumParams() !=
+          2 + (Payload ? 1 : 0) + (Primitives ? 1 : 0)) {
+    if (!Invalid)
+      Diag(FD->getLocation(), diag::err_hlsl_mesh_entry_signature);
+    FD->setInvalidDecl();
+    return;
+  }
+
+  const auto *VertexArray =
+      getASTContext().getAsConstantArrayType(Vertices->getOriginalType());
+  const RecordDecl *VertexRecord = VertexArray
+                                       ? VertexArray->getElementType()
+                                             ->getAsRecordDecl()
+                                       : nullptr;
+  if (!VertexArray || VertexArray->getSize().getZExtValue() == 0 ||
+      VertexArray->getSize().getZExtValue() > 256 || !VertexRecord ||
+      !VertexRecord->getDefinition()) {
+    Diag(Vertices->getLocation(), diag::err_hlsl_mesh_output_type)
+        << "vertices" << "record values";
+    Invalid = true;
+  }
+  const auto *IndexArray =
+      getASTContext().getAsConstantArrayType(Indices->getOriginalType());
+  const auto *IndexType = IndexArray
+                              ? IndexArray->getElementType()->getAs<VectorType>()
+                              : nullptr;
+  if (!IndexArray || IndexArray->getSize().getZExtValue() == 0 ||
+      IndexArray->getSize().getZExtValue() > 256 || !IndexType ||
+      IndexType->getNumElements() != 3 ||
+      !IndexType->getElementType()->isSpecificBuiltinType(
+          BuiltinType::UInt)) {
+    Diag(Indices->getLocation(), diag::err_hlsl_mesh_output_type)
+        << "indices" << "uint3 values";
+    Invalid = true;
+  }
+  const ConstantArrayType *PrimitiveArray = nullptr;
+  const RecordDecl *PrimitiveRecord = nullptr;
+  if (Primitives) {
+    PrimitiveArray = getASTContext().getAsConstantArrayType(
+        Primitives->getOriginalType());
+    PrimitiveRecord = PrimitiveArray
+                          ? PrimitiveArray->getElementType()->getAsRecordDecl()
+                          : nullptr;
+    if (!PrimitiveArray || PrimitiveArray->getSize().getZExtValue() == 0 ||
+        PrimitiveArray->getSize().getZExtValue() > 256 || !PrimitiveRecord ||
+        !PrimitiveRecord->getDefinition() ||
+        (IndexArray && PrimitiveArray->getSize() != IndexArray->getSize())) {
+      Diag(Primitives->getLocation(), diag::err_hlsl_mesh_output_type)
+          << "primitives" << "record values matching the indices array size";
+      Invalid = true;
+    }
+  }
+  if (Invalid) {
+    FD->setInvalidDecl();
+    return;
+  }
+
+  SemanticContext OutputSC = {};
+  OutputSC.CurrentIOType = IOType::Out;
+  bool HasPosition = false;
+  for (FieldDecl *Field : VertexRecord->fields()) {
+    if (const auto *Semantic = Field->getAttr<HLSLParsedSemanticAttr>())
+      HasPosition |= llvm::hlsl::getSemanticKind(
+                         Semantic->getSemanticName()) ==
+                     SemanticKind::Position;
+    SemanticInfo Info = {};
+    if (!determineActiveSemantic(FD, Vertices, Field, Info, OutputSC))
+      Invalid = true;
+  }
+  if (!HasPosition) {
+    Diag(Vertices->getLocation(), diag::err_hlsl_mesh_output_type)
+        << "vertices" << "a record containing SV_Position";
+    Invalid = true;
+  }
+  if (PrimitiveRecord) {
+    for (FieldDecl *Field : PrimitiveRecord->fields()) {
+      SemanticInfo Info = {};
+      if (!determineActiveSemantic(FD, Primitives, Field, Info, OutputSC))
+        Invalid = true;
+    }
+  }
+  if (Invalid)
+    FD->setInvalidDecl();
+}
+void SemaHLSL::CheckGeometryEntryPoint(FunctionDecl *FD) {
+  bool Invalid = false;
+  if (!FD->hasAttr<HLSLMaxVertexCountAttr>()) {
+    Diag(FD->getLocation(), diag::err_hlsl_geometry_missing_maxvertexcount);
+    Invalid = true;
+  }
+  if (!FD->getReturnType()->isVoidType()) {
+    Diag(FD->getLocation(), diag::err_hlsl_geometry_void_return);
+    Invalid = true;
+  }
+  if (FD->getNumParams() != 2) {
+    Diag(FD->getLocation(), diag::err_hlsl_geometry_entry_signature);
+    FD->setInvalidDecl();
+    return;
+  }
+
+  ParmVarDecl *Input = FD->getParamDecl(0);
+  ParmVarDecl *Output = FD->getParamDecl(1);
+  const auto *Primitive = Input->getAttr<HLSLGeometryInputAttr>();
+  if (!Primitive) {
+    Diag(Input->getLocation(), diag::err_hlsl_geometry_entry_signature);
+    Invalid = true;
+  }
+  StringRef PrimitiveName = Primitive ? Primitive->getSpelling() : "";
+  unsigned ExpectedVertices =
+      PrimitiveName == "point"         ? 1
+      : PrimitiveName == "line"        ? 2
+      : PrimitiveName == "triangle"    ? 3
+      : PrimitiveName == "lineadj"     ? 4
+      : PrimitiveName == "triangleadj" ? 6
+                                        : 0;
+  const auto *InputArray =
+      getASTContext().getAsConstantArrayType(Input->getOriginalType());
+  const CXXRecordDecl *InputRecord =
+      InputArray ? InputArray->getElementType()->getAsCXXRecordDecl() : nullptr;
+  if (Primitive && (!InputArray ||
+                    InputArray->getSize().getZExtValue() != ExpectedVertices ||
+                    !InputRecord || !InputRecord->getDefinition())) {
+    Diag(Input->getLocation(), diag::err_hlsl_geometry_input_type)
+        << PrimitiveName << ExpectedVertices;
+    Invalid = true;
+  }
+
+  const auto *Modifier = Output->getAttr<HLSLParamModifierAttr>();
+  QualType StreamType = Output->getType().getNonReferenceType();
+  const auto *Specialization = dyn_cast_or_null<ClassTemplateSpecializationDecl>(
+      StreamType->getAsCXXRecordDecl());
+  const CXXRecordDecl *OutputRecord = nullptr;
+  if (Modifier && Modifier->isInOut() && Specialization &&
+      (Specialization->getSpecializedTemplate()->getQualifiedNameAsString() ==
+           "hlsl::PointStream" ||
+       Specialization->getSpecializedTemplate()->getQualifiedNameAsString() ==
+           "hlsl::LineStream" ||
+       Specialization->getSpecializedTemplate()->getQualifiedNameAsString() ==
+           "hlsl::TriangleStream") &&
+      Specialization->getTemplateArgs().size() == 1) {
+    const TemplateArgument &Argument = Specialization->getTemplateArgs()[0];
+    if (Argument.getKind() == TemplateArgument::Type)
+      OutputRecord = Argument.getAsType()->getAsCXXRecordDecl();
+  }
+  if (!OutputRecord || !OutputRecord->getDefinition()) {
+    Diag(Output->getLocation(), diag::err_hlsl_geometry_stream_type);
+    Invalid = true;
+  }
+  if (Invalid) {
+    FD->setInvalidDecl();
+    return;
+  }
+
+  SemanticContext InputSC = {};
+  InputSC.CurrentIOType = IOType::In;
+  SemanticContext OutputSC = {};
+  OutputSC.CurrentIOType = IOType::Out;
+  for (FieldDecl *Field : InputRecord->fields()) {
+    SemanticInfo Info = {};
+    if (!determineActiveSemantic(FD, Input, Field, Info, InputSC))
+      Invalid = true;
+  }
+  for (FieldDecl *Field : OutputRecord->fields()) {
+    SemanticInfo Info = {};
+    if (!determineActiveSemantic(FD, Output, Field, Info, OutputSC))
+      Invalid = true;
+  }
+  if (Invalid)
+    FD->setInvalidDecl();
+}
+
 void SemaHLSL::CheckEntryPoint(FunctionDecl *FD) {
   const auto *ShaderAttr = FD->getAttr<HLSLShaderAttr>();
   assert(ShaderAttr && "Entry point has no shader attribute");
@@ -1051,12 +1517,49 @@ void SemaHLSL::CheckEntryPoint(FunctionDecl *FD) {
     llvm_unreachable("Unhandled environment in triple");
   }
 
+  if (const auto *MaxVertices = FD->getAttr<HLSLMaxVertexCountAttr>();
+      MaxVertices && ST != llvm::Triple::Geometry) {
+    diagnoseAttrStageMismatch(MaxVertices, ST, {llvm::Triple::Geometry});
+    FD->setInvalidDecl();
+  }
+  if (TargetInfo.getTriple().isSPIRV() &&
+      (ST == llvm::Triple::Geometry || ST == llvm::Triple::Hull ||
+       ST == llvm::Triple::Domain || ST == llvm::Triple::Mesh ||
+       ST == llvm::Triple::RayGeneration || ST == llvm::Triple::Intersection ||
+       ST == llvm::Triple::AnyHit || ST == llvm::Triple::ClosestHit ||
+       ST == llvm::Triple::Miss || ST == llvm::Triple::Callable)) {
+    // The direct AST backend validates the complete stage interface, including
+    // patch/stream/output-array and ray payload parameter roles.
+    return;
+  }
+  if (ST == llvm::Triple::Geometry) {
+    CheckGeometryEntryPoint(FD);
+    return;
+  }
+  if (ST == llvm::Triple::Hull) {
+    CheckHullEntryPoint(FD);
+    return;
+  }
+  if (ST == llvm::Triple::Domain) {
+    CheckDomainEntryPoint(FD);
+    return;
+  }
+  if (ST == llvm::Triple::Mesh) {
+    CheckMeshEntryPoint(FD);
+    return;
+  }
+
   SemaHLSL::SemanticContext InputSC = {};
   InputSC.CurrentIOType = IOType::In;
   SemaHLSL::SemanticContext OutputSC = {};
   OutputSC.CurrentIOType = IOType::Out;
 
   for (ParmVarDecl *Param : FD->parameters()) {
+    if (const auto *Primitive = Param->getAttr<HLSLGeometryInputAttr>()) {
+      diagnoseAttrStageMismatch(Primitive, ST, {llvm::Triple::Geometry});
+      FD->setInvalidDecl();
+      continue;
+    }
     SemanticInfo ActiveSemantic;
     ActiveSemantic.Semantic = Param->getAttr<HLSLParsedSemanticAttr>();
     if (ActiveSemantic.Semantic)
@@ -1705,6 +2208,139 @@ void SemaHLSL::handleRootSignatureAttr(Decl *D, const ParsedAttr &AL) {
     }
 }
 
+void SemaHLSL::handleMaxVertexCountAttr(Decl *D, const ParsedAttr &AL) {
+  uint32_t Count;
+  if (!SemaRef.checkUInt32Argument(AL, AL.getArgAsExpr(0), Count))
+    return;
+  if (Count == 0 || Count > 1024) {
+    Diag(AL.getLoc(), diag::err_hlsl_geometry_maxvertexcount_range);
+    return;
+  }
+  if (auto *Existing = D->getAttr<HLSLMaxVertexCountAttr>()) {
+    if (Existing->getCount() != Count) {
+      Diag(Existing->getLocation(), diag::err_hlsl_attribute_param_mismatch)
+          << AL;
+      Diag(AL.getLoc(), diag::note_conflicting_attribute);
+    }
+    return;
+  }
+  D->addAttr(::new (getASTContext())
+                 HLSLMaxVertexCountAttr(getASTContext(), AL, Count));
+}
+
+void SemaHLSL::handleTessDomainAttr(Decl *D, const ParsedAttr &AL) {
+  StringRef Domain;
+  if (!SemaRef.checkStringLiteralArgumentAttr(AL, 0, Domain))
+    return;
+  if (!llvm::is_contained({StringRef("tri"), StringRef("quad"),
+                           StringRef("isoline")},
+                          Domain)) {
+    Diag(AL.getLoc(), diag::err_hlsl_tess_invalid_attribute_value)
+        << AL << Domain;
+    return;
+  }
+  if (auto *Existing = D->getAttr<HLSLTessDomainAttr>()) {
+    Diag(AL.getLoc(), Existing->getDomain() == Domain
+                          ? diag::warn_duplicate_attribute_exact
+                          : diag::err_disallowed_duplicate_attribute)
+        << Existing;
+    return;
+  }
+  D->addAttr(::new (getASTContext())
+                 HLSLTessDomainAttr(getASTContext(), AL, Domain));
+}
+
+void SemaHLSL::handleTessPartitioningAttr(Decl *D, const ParsedAttr &AL) {
+  StringRef Partitioning;
+  if (!SemaRef.checkStringLiteralArgumentAttr(AL, 0, Partitioning))
+    return;
+  if (!llvm::is_contained({StringRef("integer"), StringRef("pow2"),
+                           StringRef("fractional_even"),
+                           StringRef("fractional_odd")},
+                          Partitioning)) {
+    Diag(AL.getLoc(), diag::err_hlsl_tess_invalid_attribute_value)
+        << AL << Partitioning;
+    return;
+  }
+  if (auto *Existing = D->getAttr<HLSLTessPartitioningAttr>()) {
+    Diag(AL.getLoc(), Existing->getPartitioning() == Partitioning
+                          ? diag::warn_duplicate_attribute_exact
+                          : diag::err_disallowed_duplicate_attribute)
+        << Existing;
+    return;
+  }
+  D->addAttr(::new (getASTContext())
+                 HLSLTessPartitioningAttr(getASTContext(), AL, Partitioning));
+}
+
+void SemaHLSL::handleTessOutputTopologyAttr(Decl *D, const ParsedAttr &AL) {
+  StringRef Topology;
+  if (!SemaRef.checkStringLiteralArgumentAttr(AL, 0, Topology))
+    return;
+  bool IsMesh = getASTContext().getTargetInfo().getTriple().getEnvironment() ==
+                llvm::Triple::Mesh;
+  bool Valid = IsMesh
+                   ? llvm::is_contained({StringRef("point"), StringRef("line"),
+                                         StringRef("triangle")}, Topology)
+                   : llvm::is_contained({StringRef("point"), StringRef("line"),
+                                         StringRef("triangle_cw"),
+                                         StringRef("triangle_ccw")}, Topology);
+  if (!Valid) {
+    Diag(AL.getLoc(), diag::err_hlsl_tess_invalid_attribute_value)
+        << AL << Topology;
+    return;
+  }
+  if (auto *Existing = D->getAttr<HLSLTessOutputTopologyAttr>()) {
+    Diag(AL.getLoc(), Existing->getTopology() == Topology
+                          ? diag::warn_duplicate_attribute_exact
+                          : diag::err_disallowed_duplicate_attribute)
+        << Existing;
+    return;
+  }
+  D->addAttr(::new (getASTContext())
+                 HLSLTessOutputTopologyAttr(getASTContext(), AL, Topology));
+}
+
+void SemaHLSL::handleTessOutputControlPointsAttr(Decl *D,
+                                                  const ParsedAttr &AL) {
+  uint32_t Count;
+  if (!SemaRef.checkUInt32Argument(AL, AL.getArgAsExpr(0), Count))
+    return;
+  if (Count == 0 || Count > 32) {
+    Diag(AL.getLoc(), diag::err_hlsl_tess_control_point_count_range);
+    return;
+  }
+  if (auto *Existing = D->getAttr<HLSLTessOutputControlPointsAttr>()) {
+    Diag(AL.getLoc(), Existing->getCount() == Count
+                          ? diag::warn_duplicate_attribute_exact
+                          : diag::err_disallowed_duplicate_attribute)
+        << Existing;
+    return;
+  }
+  D->addAttr(::new (getASTContext())
+                 HLSLTessOutputControlPointsAttr(getASTContext(), AL, Count));
+}
+
+void SemaHLSL::handleTessPatchConstantFuncAttr(Decl *D,
+                                                const ParsedAttr &AL) {
+  StringRef Function;
+  if (!SemaRef.checkStringLiteralArgumentAttr(AL, 0, Function))
+    return;
+  if (Function.empty()) {
+    Diag(AL.getLoc(), diag::err_hlsl_tess_patch_constant_function);
+    return;
+  }
+  if (auto *Existing = D->getAttr<HLSLTessPatchConstantFuncAttr>()) {
+    Diag(AL.getLoc(), Existing->getFunction() == Function
+                          ? diag::warn_duplicate_attribute_exact
+                          : diag::err_disallowed_duplicate_attribute)
+        << Existing;
+    return;
+  }
+  D->addAttr(::new (getASTContext())
+                 HLSLTessPatchConstantFuncAttr(getASTContext(), AL, Function));
+}
+
 void SemaHLSL::handleNumThreadsAttr(Decl *D, const ParsedAttr &AL) {
   llvm::VersionTuple SMVersion =
       getASTContext().getTargetInfo().getTriple().getOSVersion();
@@ -1924,10 +2560,38 @@ void SemaHLSL::diagnoseSystemSemanticAttr(Decl *D, const ParsedAttr &AL,
     break;
   case SemanticKind::GroupIndex:
     break;
+  case SemanticKind::IsFrontFace:
+    if (!ValueType->isBooleanType())
+      Diag(AL.getLoc(), diag::err_hlsl_attr_invalid_type) << AL << "bool";
+    break;
   case SemanticKind::Position:
   case SemanticKind::Target:
     diagnoseFloatType(ValueType, AL);
     break;
+  case SemanticKind::TessFactor:
+  case SemanticKind::InsideTessFactor: {
+    if (const auto *Array = getASTContext().getAsConstantArrayType(ValueType))
+      ValueType = Array->getElementType();
+    if (!ValueType->isRealFloatingType())
+      Diag(AL.getLoc(), diag::err_hlsl_attr_invalid_type)
+          << AL << "float or float array";
+    break;
+  }
+  case SemanticKind::DomainLocation: {
+    const auto *Vector = ValueType->getAs<VectorType>();
+    if (!Vector || (Vector->getNumElements() != 2 &&
+                    Vector->getNumElements() != 3) ||
+        !Vector->getElementType()->isSpecificBuiltinType(BuiltinType::Float))
+      Diag(AL.getLoc(), diag::err_hlsl_attr_invalid_type)
+          << AL << "float2 or float3";
+    break;
+  }
+  case SemanticKind::OutputControlPointID: {
+    uint64_t SizeInBits = SemaRef.Context.getTypeSize(ValueType);
+    if (!ValueType->isUnsignedIntegerType() || SizeInBits != 32)
+      Diag(AL.getLoc(), diag::err_hlsl_attr_invalid_type) << AL << "uint";
+    break;
+  }
   case SemanticKind::VertexID: {
     uint64_t SizeInBits = SemaRef.Context.getTypeSize(ValueType);
     if (!ValueType->isUnsignedIntegerType() || SizeInBits != 32)
@@ -3015,7 +3679,8 @@ void DiagnoseHLSLAvailability::RunOnTranslationUnit(
     }
   }
 
-  if (!IsLibraryShader && EntryLoc.isInvalid()) {
+  if (!IsLibraryShader && EntryLoc.isInvalid() &&
+      !(SemaRef.getLangOpts().HLSLCPlusPlus && EntryName.empty())) {
     SemaRef.Diag(TU->getLocation(), diag::err_hlsl_missing_entry_point)
         << EntryName;
     return;
@@ -4155,6 +4820,27 @@ static bool CheckSamplingBuiltin(Sema &S, CallExpr *TheCall, SampleKind Kind) {
 // returning an ExprError
 bool SemaHLSL::CheckBuiltinFunctionCall(unsigned BuiltinID, CallExpr *TheCall) {
   switch (BuiltinID) {
+  case Builtin::BI__builtin_hlsl_dispatch_mesh: {
+    if (SemaRef.checkArgCount(TheCall, 4))
+      return true;
+    if (getASTContext().getTargetInfo().getTriple().getEnvironment() !=
+        llvm::Triple::Amplification) {
+      Diag(TheCall->getBeginLoc(), diag::err_hlsl_dispatch_mesh_stage);
+      return true;
+    }
+    const auto *Ref = dyn_cast<DeclRefExpr>(
+        TheCall->getArg(3)->IgnoreParenImpCasts());
+    const auto *Payload =
+        Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+    if (!Payload || !Payload->hasGlobalStorage() ||
+        Payload->getType().getAddressSpace() != LangAS::hlsl_groupshared ||
+        !Payload->getType()->isRecordType()) {
+      Diag(TheCall->getArg(3)->getExprLoc(),
+           diag::err_hlsl_dispatch_mesh_payload);
+      return true;
+    }
+    return false;
+  }
   case Builtin::BI__builtin_hlsl_adduint64: {
     if (SemaRef.checkArgCount(TheCall, 2))
       return true;
@@ -5712,7 +6398,8 @@ void SemaHLSL::ActOnVariableDeclarator(VarDecl *VD) {
     // Global variables outside a cbuffer block that are not a resource, static,
     // groupshared, or an empty array or struct belong to the default constant
     // buffer $Globals (to be created at the end of the translation unit).
-    if (IsDefaultBufferConstantDecl(getASTContext(), VD)) {
+    if (!SemaRef.getLangOpts().HLSLCPlusPlus &&
+        IsDefaultBufferConstantDecl(getASTContext(), VD)) {
       // update address space to hlsl_constant
       QualType NewTy = getASTContext().getAddrSpaceQualType(
           VD->getType(), LangAS::hlsl_constant);
@@ -5966,7 +6653,7 @@ bool SemaHLSL::ActOnUninitializedVarDecl(VarDecl *VD) {
   while (Ty->isArrayType())
     Ty = Ty->getArrayElementTypeNoTypeQual()->getUnqualifiedDesugaredType();
   if (CXXRecordDecl *RD = Ty->getAsCXXRecordDecl())
-    return !RD->isHLSLBuiltinRecord();
+    return !SemaRef.getLangOpts().HLSLCPlusPlus && !RD->isHLSLBuiltinRecord();
 
   return false;
 }
@@ -6433,6 +7120,15 @@ static bool containsIncompleteArrayType(QualType Ty) {
 
 bool SemaHLSL::transformInitList(const InitializedEntity &Entity,
                                  InitListExpr *Init) {
+  // C++ classes keep construction, designated initialization and partial
+  // aggregate initialization. Shader vectors/matrices retain HLSL flattening.
+  if (SemaRef.getLangOpts().HLSLCPlusPlus) {
+    if (Entity.getType()->isArrayType() || Entity.getType()->isReferenceType()) return true;
+    if (const auto *R = Entity.getType()->getAsCXXRecordDecl()) {
+      if (R->hasUserDeclaredConstructor() || Init->getNumInits() <= std::distance(R->field_begin(), R->field_end())) return true;
+      for (const Expr *I : Init->inits()) if (isa<DesignatedInitExpr>(I)) return true;
+    }
+  }
   // If the initializer is a scalar, just return it.
   if (Init->getType()->isScalarType())
     return true;

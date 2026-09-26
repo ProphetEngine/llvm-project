@@ -13,6 +13,7 @@ def workgroup_size : SPIRVBuiltin<"size_t(int)", [NoThrow, Const]>;
 def workgroup_id : SPIRVBuiltin<"size_t(int)", [NoThrow, Const]>;
 def local_invocation_id : SPIRVBuiltin<"size_t(int)", [NoThrow, Const]>;
 def global_invocation_id : SPIRVBuiltin<"size_t(int)", [NoThrow, Const]>;
+def launch_id : SPIRVBuiltin<"uint32_t(int)", [NoThrow, Const]>;
 def subgroup_size : SPIRVBuiltin<"uint32_t()", [NoThrow, Const]>;
 def num_subgroups : SPIRVBuiltin<"uint32_t()", [NoThrow, Const]>;
 def subgroup_id : SPIRVBuiltin<"uint32_t()", [NoThrow, Const]>;

@@ -16378,7 +16378,7 @@ ExprResult Sema::BuildBinOp(Scope *S, SourceLocation OpLoc,
 
   if (getLangOpts().CPlusPlus) {
     bool CanOverloadBinOp =
-        !getLangOpts().HLSL ||
+        !getLangOpts().HLSL || getLangOpts().HLSLCPlusPlus ||
         HLSL().canHaveOverloadedBinOp(LHSExpr->getType(), Opc) ||
         HLSL().canHaveOverloadedBinOp(RHSExpr->getType(), Opc);
     bool TypeDependent =
@@ -16468,7 +16468,7 @@ ExprResult Sema::CreateBuiltinUnaryOp(SourceLocation OpLoc,
     }
   }
 
-  if (getLangOpts().HLSL && OpLoc.isValid()) {
+  if (getLangOpts().HLSL && !getLangOpts().HLSLCPlusPlus && OpLoc.isValid()) {
     if (Opc == UO_AddrOf)
       return ExprError(Diag(OpLoc, diag::err_hlsl_operator_unsupported) << 0);
     if (Opc == UO_Deref)
