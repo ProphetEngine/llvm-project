@@ -425,6 +425,14 @@ SpirvValue ProphetSpirvEmitter::load(SpirvValue V) {
     V = loadInterface(V); V.Swizzle = std::move(Swizzle);
   }
   V = address(V);
+  // A storage buffer value is a descriptor receiver, not the contents of its
+  // block. Builtin resource copy construction and by-value helper arguments
+  // retain this provenance; only resourceIndex produces a loadable element.
+  // Loading the block here would also attempt to load its runtime-sized array.
+  if (V.Resource && V.Resource->K == SpirvResource::Buffer) {
+    UsedGlobals.insert(V.Resource->Variable);
+    return V;
+  }
   if (V.Resource && V.Resource->K != SpirvResource::Buffer) {
     UsedGlobals.insert(V.Resource->Variable);
     if (V.Address) V.Id = valueOp(OpLoad, V.Resource->Type, {V.Id});

@@ -253,7 +253,7 @@ void HLSLExternalSemaSource::defineHeapResourceInfoTypes() {
                                .finalizeForwardDeclaration();
   if (!ResDecl->isCompleteDefinition())
     BuiltinTypeDeclBuilder(*SemaPtr, ResDecl)
-        .addMemberVariable("Index", AST.UnsignedIntTy, {})
+        .addMemberVariable("Index", AST.UnsignedIntTy, {}, AccessSpecifier::AS_public)
         .completeDefinition();
 
   CXXRecordDecl *SampDecl =
@@ -261,7 +261,7 @@ void HLSLExternalSemaSource::defineHeapResourceInfoTypes() {
           .finalizeForwardDeclaration();
   if (!SampDecl->isCompleteDefinition())
     BuiltinTypeDeclBuilder(*SemaPtr, SampDecl)
-        .addMemberVariable("Index", AST.UnsignedIntTy, {})
+        .addMemberVariable("Index", AST.UnsignedIntTy, {}, AccessSpecifier::AS_public)
         .completeDefinition();
 }
 

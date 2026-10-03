@@ -39,6 +39,8 @@ static void objectUses(const FunctionDecl *F, std::map<std::string, std::string>
 }
 
 bool ProphetSpirvEmitter::isObjectBoundary(const FunctionDecl *F) const {
+  if (const auto *Method = dyn_cast<CXXMethodDecl>(F); Method && !Method->isStatic() &&
+      shaderAttribute(F, "table_access")) return false;
   return shaderAttribute(F, "export") || shaderAttribute(F, "import") ||
          shaderAttribute(F, "slot") || shaderAttribute(F, "table_access");
 }
@@ -194,7 +196,7 @@ void ProphetSpirvEmitter::scanObjectFunctions(const DeclContext *DC) {
       else if (shaderAttribute(F, "default")) fail("shader::default requires shader::slot", F->getLocation());
     } else if (const auto *N = dyn_cast<NamespaceDecl>(D)) scanObjectFunctions(N);
     else if (const auto *V = dyn_cast<VarDecl>(D); V && shaderAttribute(V, "table"))
-      fail("shader::table variables require a generated typed table accessor facade", V->getLocation());
+      continue;
     else if (const auto *L = dyn_cast<LinkageSpecDecl>(D)) scanObjectFunctions(L);
     else if (const auto *R = dyn_cast<CXXRecordDecl>(D); R && R->isCompleteDefinition()) scanObjectFunctions(R);
   }
@@ -220,6 +222,93 @@ SpirvValue ProphetSpirvEmitter::objectCall(const FunctionDecl *F, ArrayRef<Spirv
   uint32_t Result = valueOp(OpFunctionCall, Info.ReturnType, Operands);
   if (F->getReturnType()->isVoidType()) return {};
   return valueAbiConvert({Result, Info.ReturnType}, F->getReturnType(), false);
+}
+
+SpirvValue ProphetSpirvEmitter::objectTableCall(const VarDecl *Table,
+    const FunctionDecl *Method, ArrayRef<SpirvValue> Args) {
+  Table = Table->getCanonicalDecl();
+  Method = Method->getCanonicalDecl();
+  const auto *Attribute = shaderAttribute(Table, "table");
+  const auto *Member = dyn_cast<CXXMethodDecl>(Method);
+  const auto *Specialization = Member ? dyn_cast<ClassTemplateSpecializationDecl>(Member->getParent()) : nullptr;
+  if (!ObjectMode || !Attribute || !Specialization || Specialization->getName() != "ShaderTable" ||
+      Specialization->getTemplateArgs().size() != 1 ||
+      Specialization->getTemplateArgs()[0].getKind() != TemplateArgument::Type)
+  {
+    fail("a shader table call requires a declared ShaderTable<T> global", Table->getLocation());
+    return {};
+  }
+  QualType Row = Specialization->getTemplateArgs()[0].getAsType();
+  if (!Row->getAsTagDecl() || shaderTypeId(Row->getAsTagDecl()).empty()) {
+    fail("a shader table row requires a published shader::type", Table->getLocation());
+    return {};
+  }
+  StringRef Name = Method->getName();
+  const auto *AccessAttribute = shaderAttribute(Method, "table_access");
+  if (Name != "Count" && Name != "LoadRow" && Name != "StoreRow" && !AccessAttribute) {
+    fail("unsupported ShaderTable<T> operation", Method->getLocation());
+    return {};
+  }
+  std::string TableId = shaderAttributeString(Attribute, 0);
+  if (TableId.empty()) TableId = Table->getQualifiedNameAsString();
+  if (shaderAttributeString(Attribute, 1) == "read" &&
+      (Name.starts_with("Store") || Name.starts_with("Atomic"))) {
+    fail("read-only shader table does not permit " + Name.str(), Table->getLocation());
+    return {};
+  }
+  for (const auto &Existing : ObjectFunctions)
+    if (Existing.TableDecl && Existing.TableDecl != Table && [&] {
+        std::string ExistingId = shaderAttributeString(shaderAttribute(Existing.TableDecl, "table"), 0);
+        if (ExistingId.empty()) ExistingId = Existing.TableDecl->getQualifiedNameAsString();
+        return ExistingId == TableId;
+      }()) {
+      fail("two distinct table variables declare '" + TableId + "'", Table->getLocation());
+      return {};
+    }
+  auto Key = std::make_pair(Table, Method);
+  auto Found = ObjectTableFunctionIndices.find(Key);
+  if (Found == ObjectTableFunctionIndices.end()) {
+    ObjectFunction Info;
+    Info.Decl = Method;
+    Info.TableDecl = Table;
+    Info.Id = id();
+    Info.Name = Name.str();
+    Info.StableId = TableId + "." + Info.Name;
+    Info.Role = "tableAccessor";
+    Info.ReturnType = valueAbiType(Method->getReturnType());
+    std::vector<uint32_t> FunctionTypes{Info.ReturnType};
+    for (const ParmVarDecl *Parameter : Method->parameters()) {
+      uint32_t Type = valueAbiType(Parameter->getType());
+      Info.Parameters.push_back(Type);
+      FunctionTypes.push_back(Type);
+    }
+    if (!Diagnostic.empty()) return {};
+    Info.FunctionType = internType(OpTypeFunction, FunctionTypes, {});
+    Decorations.string(OpDecorate, {Info.Id, Decoration::LinkageAttributes},
+                       "prophet." + ObjectModuleId + "." + std::to_string(Info.Id),
+                       {LinkageType::Import});
+    name(Info.Id, Info.StableId);
+    ObjectTableFunctionIndices[Key] = ObjectFunctions.size();
+    ObjectFunctions.push_back(Info);
+    FunctionDeclarations.emit(OpFunction, {Info.ReturnType, Info.Id,
+                                           FunctionControl::None, Info.FunctionType});
+    for (uint32_t Type : Info.Parameters)
+      FunctionDeclarations.emit(OpFunctionParameter, {Type, id()});
+    FunctionDeclarations.emit(OpFunctionEnd);
+    Found = ObjectTableFunctionIndices.find(Key);
+  }
+  const ObjectFunction &Info = ObjectFunctions[Found->second];
+  if (Args.size() != Info.Parameters.size()) {
+    fail("shader table argument count mismatch", Method->getLocation());
+    return {};
+  }
+  std::vector<uint32_t> Operands{Info.Id};
+  for (unsigned I = 0; I < Args.size(); ++I)
+    Operands.push_back(valueAbiConvert(Args[I], Method->getParamDecl(I)->getType(), true).Id);
+  if (!Diagnostic.empty()) return {};
+  uint32_t Result = valueOp(OpFunctionCall, Info.ReturnType, Operands);
+  if (Method->getReturnType()->isVoidType()) return {};
+  return valueAbiConvert({Result, Info.ReturnType}, Method->getReturnType(), false);
 }
 
 bool ProphetSpirvEmitter::emitObjectFunction(size_t Index) {
@@ -276,7 +365,7 @@ bool ProphetSpirvEmitter::runObject(StringRef ModuleId, std::vector<uint8_t> &Ou
     if (!entry(EntryFunctions.front())) return false;
   }
   if (ObjectFunctions.empty() && EntryName.empty()) return fail("shader object has no exports or entry");
-  json::Array FunctionsJson, ResourceJson, Uses;
+  json::Array FunctionsJson, ResourceJson, TableJson, Uses;
   std::map<std::pair<std::string, std::string>, std::string> Selections;
   auto AddUses = [&](const FunctionDecl *F, const std::string &Component) {
     std::map<std::string, std::string> Local;
@@ -311,15 +400,50 @@ bool ProphetSpirvEmitter::runObject(StringRef ModuleId, std::vector<uint8_t> &Ou
       Item["memberName"] = F.Name;
       Item["id"] = shaderAttributeString(A, 0) + "." + F.Name;
     }
+    if (F.TableDecl) {
+      std::string TableId = shaderAttributeString(shaderAttribute(F.TableDecl, "table"), 0);
+      if (TableId.empty()) TableId = F.TableDecl->getQualifiedNameAsString();
+      Item["tableId"] = TableId;
+      const auto *Access = shaderAttribute(F.Decl, "table_access");
+      Item["fieldId"] = Access ? shaderAttributeString(Access, 1) : "";
+      Item["operation"] = Access ? shaderAttributeString(Access, 2) : F.Name;
+      Item["instanceName"] = TableId;
+      Item["memberName"] = F.Name;
+      Item["id"] = TableId + "." + F.Name;
+    }
     if (F.Role == "export") AddUses(F.Decl, objectComponent(F.Decl));
     FunctionsJson.push_back(std::move(Item));
   }
   std::string EntryComponent;
+  std::string ProgramId;
   if (!EntryName.empty()) {
     EntryComponent = objectComponent(EntryFunctions.front());
+    ProgramId = shaderAttributeString(shaderAttribute(EntryFunctions.front(), "program"), 0);
+    if (ProgramId.empty()) ProgramId = EntryFunctions.front()->getQualifiedNameAsString();
     AddUses(EntryFunctions.front(), EntryComponent);
   }
   if (!Diagnostic.empty()) return false;
+  std::set<std::string> SeenTables;
+  for (const auto &F : ObjectFunctions) if (F.TableDecl) {
+    std::string TableId = shaderAttributeString(shaderAttribute(F.TableDecl, "table"), 0);
+    if (TableId.empty()) TableId = F.TableDecl->getQualifiedNameAsString();
+    if (!SeenTables.insert(TableId).second) continue;
+    const auto *Method = cast<CXXMethodDecl>(F.Decl);
+    const auto *Specialization = cast<ClassTemplateSpecializationDecl>(Method->getParent());
+    QualType Row = Specialization->getTemplateArgs()[0].getAsType();
+    const auto *TableAttribute = shaderAttribute(F.TableDecl, "table");
+    std::string Layout = shaderAttributeString(TableAttribute, 2);
+    uint64_t PageRows = 256;
+    if (TableAttribute->args_size() > 3) {
+      Expr::EvalResult Value;
+      TableAttribute->args_begin()[3]->EvaluateAsInt(Value, Ctx);
+      PageRows = Value.Val.getInt().getZExtValue();
+    }
+    TableJson.push_back(json::Object{{"id", TableId},
+      {"rowTypeId", shaderTypeId(Row->getAsTagDecl())}, {"rowAbiHash", ""},
+      {"access", shaderAttributeString(shaderAttribute(F.TableDecl, "table"), 1) == "read" ? "Read" : "ReadWrite"},
+      {"defaultLayout", Layout.empty() ? "SoA" : Layout}, {"pageRows", PageRows}});
+  }
   for (const auto &[Key, Target] : Selections)
     Uses.push_back(json::Object{{"componentId", Key.first}, {"path", Key.second}, {"target", Target}});
   for (const auto &[Variable, D] : ObjectResourceOwners) {
@@ -343,8 +467,9 @@ bool ProphetSpirvEmitter::runObject(StringRef ModuleId, std::vector<uint8_t> &Ou
     ResourceJson.push_back(std::move(Item));
   }
   raw_string_ostream Stream(Manifest);
-  Stream << json::Value(json::Object{{"formatVersion", 1}, {"valueAbiVersion", 1}, {"moduleId", ObjectModuleId}, {"entryComponentId", EntryComponent},
-      {"functions", std::move(FunctionsJson)}, {"resources", std::move(ResourceJson)}, {"uses", std::move(Uses)}, {"typeContracts", json::Object{}}});
+  Stream << json::Value(json::Object{{"formatVersion", 2}, {"valueAbiVersion", 1}, {"moduleId", ObjectModuleId}, {"entryComponentId", EntryComponent},
+      {"programId", ProgramId.empty() ? json::Value(nullptr) : json::Value(ProgramId)},
+      {"functions", std::move(FunctionsJson)}, {"resources", std::move(ResourceJson)}, {"tables", std::move(TableJson)}, {"uses", std::move(Uses)}, {"typeContracts", json::Object{}}});
   return finish(Output);
 }
 

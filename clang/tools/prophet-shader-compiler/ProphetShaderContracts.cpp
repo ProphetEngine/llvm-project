@@ -11,7 +11,7 @@
 using namespace clang;
 using namespace llvm;
 namespace {
-enum class Role { Type, Projection, Shape, Field, Meta, Export, Import, Slot, Default, Use, Resource, Table, TableAccess };
+enum class Role { Type, Projection, Shape, Field, Meta, Export, Import, Slot, Default, Use, Resource, Table, TableAccess, Program };
 
 template <Role R> struct ShaderAttributeInfo final : ParsedAttrInfo {
   ShaderAttributeInfo() {
@@ -23,9 +23,9 @@ template <Role R> struct ShaderAttributeInfo final : ParsedAttrInfo {
     static const Spelling Names[] = {{ParsedAttr::AS_CXX11, Name.c_str()},
                                     {ParsedAttr::AS_CXX11, Unqualified.c_str()}};
     Spellings = Names;
-    NumArgs = R == Role::Slot || R == Role::Type || R == Role::Field ? 0 :
+    NumArgs = R == Role::Slot || R == Role::Type || R == Role::Field || R == Role::Table || R == Role::Program ? 0 :
               R == Role::Use || R == Role::Projection || R == Role::Meta ? 2 : R == Role::TableAccess ? 3 : 1;
-    OptArgs = R == Role::Type ? 3 : R == Role::Slot ? 2 : R == Role::Field || R == Role::Export ? 1 : 0;
+    OptArgs = R == Role::Table ? 4 : R == Role::Type ? 3 : R == Role::Slot ? 2 : R == Role::Field || R == Role::Export || R == Role::Program ? 1 : 0;
   }
   static StringRef roleName() {
     switch (R) {
@@ -42,6 +42,7 @@ template <Role R> struct ShaderAttributeInfo final : ParsedAttrInfo {
     case Role::Resource: return "resource";
     case Role::Table: return "table";
     case Role::TableAccess: return "table_access";
+    case Role::Program: return "program";
     }
     llvm_unreachable("shader attribute role");
   }
@@ -72,12 +73,12 @@ template <Role R> struct ShaderAttributeInfo final : ParsedAttrInfo {
     SmallVector<Expr *, 3> Args;
     for (unsigned I = 0; I < A.getNumArgs(); ++I) {
       Expr *E = A.getArgAsExpr(I);
-      if (R == Role::Type && I == 1) {
+      if ((R == Role::Type && I == 1) || (R == Role::Table && I == 3)) {
         Expr::EvalResult Value;
         if (!E->EvaluateAsInt(Value, S.Context) || Value.Val.getInt().isNegative() ||
             Value.Val.getInt().isZero() || Value.Val.getInt().getActiveBits() > 31) {
           unsigned Id = S.getDiagnostics().getCustomDiagID(DiagnosticsEngine::Error,
-              "shader type version must be a positive 32-bit constant");
+              "shader type version or table page rows must be a positive 32-bit constant");
           S.Diag(E->getExprLoc(), Id);
           return AttributeNotApplied;
         }
@@ -90,13 +91,33 @@ template <Role R> struct ShaderAttributeInfo final : ParsedAttrInfo {
           return AttributeNotApplied;
         }
       } else if (const auto *Text = dyn_cast<clang::StringLiteral>(E->IgnoreParenImpCasts());
-                 !Text || (Text->getBytes().trim().empty() && !((R == Role::TableAccess || R == Role::Meta) && I == 1)) || Text->getBytes().contains('\0')) {
+                 !Text || (Text->getBytes().trim().empty() && !(R == Role::TableAccess && I <= 1) && !(R == Role::Meta && I == 1)) || Text->getBytes().contains('\0')) {
         unsigned Id = S.getDiagnostics().getCustomDiagID(DiagnosticsEngine::Error,
             "shader attribute argument must be a nonempty string literal");
         S.Diag(E->getExprLoc(), Id);
         return AttributeNotApplied;
       }
       Args.push_back(E);
+    }
+    if constexpr (R == Role::Table) {
+      if (Args.size() > 1) {
+        StringRef Access = cast<clang::StringLiteral>(Args[1]->IgnoreParenImpCasts())->getBytes();
+        if (Access != "read" && Access != "readwrite") {
+          unsigned Id = S.getDiagnostics().getCustomDiagID(DiagnosticsEngine::Error,
+              "shader::table access must be 'read' or 'readwrite'");
+          S.Diag(Args[1]->getExprLoc(), Id);
+          return AttributeNotApplied;
+        }
+      }
+      if (Args.size() > 2) {
+        StringRef Layout = cast<clang::StringLiteral>(Args[2]->IgnoreParenImpCasts())->getBytes();
+        if (Layout != "AoS" && Layout != "SoA" && Layout != "PagedSoA") {
+          unsigned Id = S.getDiagnostics().getCustomDiagID(DiagnosticsEngine::Error,
+              "shader::table layout must be AoS, SoA or PagedSoA");
+          S.Diag(Args[2]->getExprLoc(), Id);
+          return AttributeNotApplied;
+        }
+      }
     }
     // Canonical redeclarations may repeat an attribute, but cannot change its
     // meaning. The semantic extractor must never depend on redeclaration order.
@@ -156,6 +177,7 @@ ParsedAttrInfoRegistry::Add<ShaderAttributeInfo<Role::Use>> UseAttr("prophet-sha
 ParsedAttrInfoRegistry::Add<ShaderAttributeInfo<Role::Resource>> ResourceAttr("prophet-shader-resource", "");
 ParsedAttrInfoRegistry::Add<ShaderAttributeInfo<Role::Table>> TableAttr("prophet-shader-table", "");
 ParsedAttrInfoRegistry::Add<ShaderAttributeInfo<Role::TableAccess>> TableAccessAttr("prophet-shader-table-access", "");
+ParsedAttrInfoRegistry::Add<ShaderAttributeInfo<Role::Program>> ProgramAttr("prophet-shader-program", "");
 }
 
 namespace prophet {
@@ -306,12 +328,80 @@ bool extractShaderContracts(ASTContext &Ctx, StringRef ModuleId, std::string &Js
     std::string &Error;
     std::set<const TagDecl *> Seen;
     std::set<const FunctionDecl *> SeenFunctions;
+    std::set<const Decl *> SeenSymbols;
     std::set<std::string> Ids;
   public:
     json::Array Types;
     json::Array Projections;
     json::Array Functions;
+    json::Array Symbols;
+    json::Array Defaults;
     Reader(ASTContext &C, std::string &E) : Ctx(C), Error(E) {}
+    std::string source(const Decl *D) {
+      PresumedLoc Location = Ctx.getSourceManager().getPresumedLoc(D->getLocation());
+      return Location.isValid() ? std::string(Location.getFilename()) + ":" + std::to_string(Location.getLine()) +
+          ":" + std::to_string(Location.getColumn()) : "";
+    }
+    bool VisitVarDecl(VarDecl *D) {
+      const auto *A = shaderAttribute(D, "table");
+      if (!A || !SeenSymbols.insert(D->getCanonicalDecl()).second) return true;
+      const auto *Table = dyn_cast_or_null<ClassTemplateSpecializationDecl>(D->getType()->getAsCXXRecordDecl());
+      if (!Table || Table->getName() != "ShaderTable" || Table->getTemplateArgs().size() != 1 ||
+          Table->getTemplateArgs()[0].getKind() != TemplateArgument::Type) {
+        Error = "shader::table requires a closed ShaderTable<T> declaration"; return false;
+      }
+      const auto *Row = Table->getTemplateArgs()[0].getAsType()->getAsTagDecl();
+      if (!Row || shaderTypeId(Row).empty()) { Error = "shader::table requires a published row"; return false; }
+      std::string Id = shaderAttributeString(A);
+      if (Id.empty()) Id = D->getQualifiedNameAsString();
+      Symbols.push_back(json::Object{{"kind", "Table"}, {"id", Id}, {"name", D->getNameAsString()},
+          {"rowTypeId", shaderTypeId(Row)}, {"source", source(D)},
+          {"access", shaderAttributeString(A, 1) == "read" ? "Read" : "ReadWrite"}});
+      return true;
+    }
+    void symbol(FunctionDecl *D) {
+      const auto *Export = shaderAttribute(D, "export"), *Slot = shaderAttribute(D, "slot"),
+                 *Import = shaderAttribute(D, "import"), *Program = shaderAttribute(D, "program");
+      if ((!Export && !Slot && !Import && !Program) || !SeenSymbols.insert(D->getCanonicalDecl()).second) return;
+      std::string Component = shaderAttributeString(Export, 1);
+      if (Component.empty())
+        if (const auto *Context = dyn_cast<NamedDecl>(D->getDeclContext())) Component = Context->getQualifiedNameAsString();
+      if (Component.empty() && Export) Component = shaderAttributeString(Export);
+      if (Program) {
+        std::string Id = shaderAttributeString(Program);
+        if (Id.empty()) Id = D->getQualifiedNameAsString();
+        Symbols.push_back(json::Object{{"kind", "Program"}, {"id", Id}, {"name", D->getNameAsString()},
+            {"componentId", Component}, {"source", source(D)}});
+      }
+      if (Export || Slot || Import) {
+        std::string Id = shaderAttributeString(Export ? Export : Slot ? Slot : Import);
+        if (Id.empty()) Id = D->getNameAsString();
+        std::string Signature = shaderValueSignature(Ctx, D->getReturnType()) + "(";
+        for (const ParmVarDecl *P : D->parameters()) {
+          if (P != *D->param_begin()) Signature += ",";
+          Signature += shaderValueSignature(Ctx, P->getType());
+        }
+        Signature += ")";
+        json::Object Item{{"kind", Export ? "Export" : Import ? "Import" : "Slot"}, {"id", Id},
+            {"name", Slot ? Id : D->getNameAsString()}, {"componentId", Component}, {"source", source(D)}, {"signature", Signature}};
+        if (Import) Item["target"] = shaderAttributeString(Import);
+        if (Slot && Slot->args_size() > 1) {
+          Expr::EvalResult Visibility;
+          Slot->args_begin()[1]->EvaluateAsInt(Visibility, Ctx);
+          Item["isPublic"] = Visibility.Val.getInt() != 0;
+        }
+        if (const auto *Default = shaderAttribute(D, "default")) Item["defaultTarget"] = shaderAttributeString(Default);
+        Symbols.push_back(std::move(Item));
+      }
+      auto Uses = [&](const Decl *Owner) {
+        for (const auto *A : Owner->specific_attrs<AnnotateAttr>())
+          if (A->getAnnotation() == "prophet.shader.use") Defaults.push_back(json::Object{
+              {"componentId", Component}, {"path", shaderAttributeString(A)}, {"target", shaderAttributeString(A, 1)}});
+      };
+      for (const auto *Redecl : D->redecls()) Uses(Redecl);
+      for (const DeclContext *Owner = D->getDeclContext(); !Owner->isTranslationUnit(); Owner = Owner->getParent())
+        Uses(Decl::castFromDeclContext(Owner));
+    }
     bool VisitDecl(Decl *D) {
       // Parsed attributes are attached before Sema connects every redeclaration.
       // Recheck the completed canonical chain after name lookup and merging.
@@ -349,6 +439,7 @@ bool extractShaderContracts(ASTContext &Ctx, StringRef ModuleId, std::string &Js
       return Error.empty();
     }
     bool VisitFunctionDecl(FunctionDecl *D) {
+      symbol(D);
       const auto *A = shaderAttribute(D, "export");
       if (!A || !SeenFunctions.insert(D->getCanonicalDecl()).second) return true;
       if (D->isVariadic() || D->isDependentContext() || D->getReturnType()->isUndeducedType() ||
@@ -452,7 +543,8 @@ bool extractShaderContracts(ASTContext &Ctx, StringRef ModuleId, std::string &Js
   if (!R.TraverseDecl(Ctx.getTranslationUnitDecl()) || !Error.empty()) return false;
   raw_string_ostream Stream(Json);
   Stream << json::Value(json::Object{{"moduleId", ModuleId.str()}, {"types", std::move(R.Types)},
-                                   {"projections", std::move(R.Projections)}, {"functions", std::move(R.Functions)}});
+                                   {"projections", std::move(R.Projections)}, {"functions", std::move(R.Functions)},
+                                   {"symbols", std::move(R.Symbols)}, {"defaults", std::move(R.Defaults)}});
   return true;
 }
 }

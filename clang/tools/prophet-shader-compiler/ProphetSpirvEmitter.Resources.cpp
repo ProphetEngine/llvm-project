@@ -239,7 +239,7 @@ bool ProphetSpirvEmitter::constantBuffer(const HLSLBufferDecl *D) {
 }
 bool ProphetSpirvEmitter::global(const VarDecl *D) {
   if (shaderAttribute(D, "table"))
-    return fail("shader::table variables require a generated typed table accessor facade", D->getLocation());
+    return true;
   if (shaderAttribute(D, "resource")) {
     if (resource(D)) return Diagnostic.empty();
     return fail("shader::resource requires a shader descriptor resource", D->getLocation());
@@ -287,6 +287,17 @@ SpirvValue ProphetSpirvEmitter::resourceIndex(SpirvValue Object, SpirvValue Inde
   if (R->Count > 1 && !Object.DescriptorSelected) {
     uint32_t P = valueOp(OpAccessChain, pointerType(R->Type, Object.Storage),
                         {R->Variable, Index.Id});
+    bool ConstantIndex = false;
+    for (const auto &Entry : ConstantKeys) ConstantIndex |= Entry.second == Index.Id;
+    // This lowering adds nonuniform support for storage buffer descriptor
+    // arrays. Other resource kinds keep their existing stage/feature contract.
+    if (!ConstantIndex && R->K == SpirvResource::Buffer && !R->Uniform) {
+      extension("SPV_EXT_descriptor_indexing");
+      capability(Capability::ShaderNonUniform);
+      capability(Capability::StorageBufferArrayNonUniformIndexing);
+      decorate(Index.Id, Decoration::NonUniform);
+      decorate(P, Decoration::NonUniform);
+    }
     Object.Id = P; Object.Type = R->Type; Object.Address = true; Object.DescriptorSelected = true;
     return Object;
   }

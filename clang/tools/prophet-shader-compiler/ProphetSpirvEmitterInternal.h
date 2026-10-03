@@ -166,11 +166,13 @@ class ProphetSpirvEmitter {
   std::string ObjectModuleId;
   struct ObjectFunction {
     const clang::FunctionDecl *Decl = nullptr;
+    const clang::VarDecl *TableDecl = nullptr;
     uint32_t Id = 0, ReturnType = 0, FunctionType = 0;
     std::vector<uint32_t> Parameters;
     std::string StableId, Role, Name, Target, DefaultTarget;
   };
   std::map<const clang::FunctionDecl *, size_t> ObjectFunctionIndices;
+  std::map<std::pair<const clang::VarDecl *, const clang::FunctionDecl *>, size_t> ObjectTableFunctionIndices;
   std::vector<ObjectFunction> ObjectFunctions;
   std::map<uint32_t, const clang::NamedDecl *> ObjectResourceOwners;
   SpirvWords FunctionDeclarations;
@@ -179,6 +181,8 @@ class ProphetSpirvEmitter {
   bool emitObjectFunction(size_t Index);
   bool isObjectBoundary(const clang::FunctionDecl *F) const;
   SpirvValue objectCall(const clang::FunctionDecl *F, llvm::ArrayRef<SpirvValue> Args);
+  SpirvValue objectTableCall(const clang::VarDecl *Table, const clang::FunctionDecl *Method,
+                             llvm::ArrayRef<SpirvValue> Args);
   uint32_t valueAbiType(QualType T);
   SpirvValue valueAbiConvert(SpirvValue V, QualType T, bool ToAbi);
 

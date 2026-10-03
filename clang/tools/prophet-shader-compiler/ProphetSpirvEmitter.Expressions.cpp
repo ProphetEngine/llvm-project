@@ -430,6 +430,15 @@ SpirvValue ProphetSpirvEmitter::call(const CallExpr *E) {
   if (SpirvValue Constant = constantExpr(E)) return Constant;
   const FunctionDecl *F = E->getDirectCallee();
   if (!F) { fail("shader indirect calls require a statically resolved target", E->getExprLoc()); return {}; }
+  if (ObjectMode)
+    if (const auto *M = dyn_cast<CXXMemberCallExpr>(E))
+      if (const auto *Reference = dyn_cast<DeclRefExpr>(M->getImplicitObjectArgument()->IgnoreParenImpCasts()))
+        if (const auto *Table = dyn_cast<VarDecl>(Reference->getDecl()); Table && shaderAttribute(Table, "table")) {
+          std::vector<SpirvValue> Arguments;
+          for (const Expr *Argument : E->arguments()) Arguments.push_back(expression(Argument));
+          if (!Diagnostic.empty()) return {};
+          return objectTableCall(Table, F, Arguments);
+        }
   SpirvValue Object;
   unsigned First = 0;
   if (const auto *M = dyn_cast<CXXMemberCallExpr>(E)) Object = expression(M->getImplicitObjectArgument());
