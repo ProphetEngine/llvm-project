@@ -29,6 +29,52 @@ static const uint RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES = 0x200;
 static const uint HIT_KIND_TRIANGLE_FRONT_FACE = 0xfe;
 static const uint HIT_KIND_TRIANGLE_BACK_FACE = 0xff;
 
+static const uint CANDIDATE_NON_OPAQUE_TRIANGLE = 0;
+static const uint CANDIDATE_PROCEDURAL_PRIMITIVE = 1;
+static const uint COMMITTED_NOTHING = 0;
+static const uint COMMITTED_TRIANGLE_HIT = 1;
+static const uint COMMITTED_PROCEDURAL_PRIMITIVE_HIT = 2;
+
+// Opaque function-local state. The AST emitter lowers these declarations to
+// RayQueryKHR instructions; no ordinary record storage or copy is permitted.
+template<uint Flags> struct RayQuery {
+  void TraceRayInline(RaytracingAccelerationStructure scene, uint flags,
+                      uint inclusionMask, RayDesc ray);
+  bool Proceed();
+  void Abort();
+  void CommitNonOpaqueTriangleHit();
+  void CommitProceduralPrimitiveHit(float rayT);
+  uint CandidateType();
+  uint CommittedStatus();
+  uint RayFlags();
+  float RayTMin();
+  float3 WorldRayOrigin();
+  float3 WorldRayDirection();
+  float CandidateTriangleRayT();
+  float CommittedRayT();
+  uint CandidateInstanceID();
+  uint CommittedInstanceID();
+  uint CandidateInstanceIndex();
+  uint CommittedInstanceIndex();
+  uint CandidateGeometryIndex();
+  uint CommittedGeometryIndex();
+  uint CandidatePrimitiveIndex();
+  uint CommittedPrimitiveIndex();
+  float2 CandidateTriangleBarycentrics();
+  float2 CommittedTriangleBarycentrics();
+  bool CandidateTriangleFrontFace();
+  bool CommittedTriangleFrontFace();
+  bool CandidateProceduralPrimitiveNonOpaque();
+  float3 CandidateObjectRayOrigin();
+  float3 CommittedObjectRayOrigin();
+  float3 CandidateObjectRayDirection();
+  float3 CommittedObjectRayDirection();
+  float3x4 CandidateObjectToWorld3x4();
+  float3x4 CommittedObjectToWorld3x4();
+  float3x4 CandidateWorldToObject3x4();
+  float3x4 CommittedWorldToObject3x4();
+};
+
 template<typename T>
 void TraceRay(RaytracingAccelerationStructure scene, uint rayFlags, uint inclusionMask,
               uint rayContributionToHitGroupIndex, uint multiplierForGeometryContributionToHitGroupIndex,

@@ -46,6 +46,9 @@ bool ProphetSpirvEmitter::isObjectBoundary(const FunctionDecl *F) const {
 }
 
 uint32_t ProphetSpirvEmitter::valueAbiType(QualType T) {
+  if (isRayQuery(T)) {
+    fail("RayQuery cannot cross a public shader function boundary"); return 0;
+  }
   if (T->isReferenceType() || T->isPointerType() || T->isDependentType()) {
     fail("public shader functions require concrete value types, not pointers/references");
     return 0;
@@ -347,7 +350,10 @@ bool ProphetSpirvEmitter::emitObjectFunction(size_t Index) {
 bool ProphetSpirvEmitter::runObject(StringRef ModuleId, std::vector<uint8_t> &Output, std::string &Manifest) {
   ObjectMode = true;
   ObjectModuleId = ModuleId.str();
-  Precise = true;
+  // HLSL object and direct-entry compilation must honour the same source
+  // contract. Explicit precise remains conservatively transitive across the
+  // translation unit. C++ shader objects retain their existing strict default.
+  Precise = !Ctx.getLangOpts().HLSL || Ctx.getLangOpts().HLSLCPlusPlus || sourceUsesPrecise();
   capability(Capability::Shader);
   capability(Capability::Linkage);
   scanObjectFunctions(Ctx.getTranslationUnitDecl());
@@ -467,7 +473,8 @@ bool ProphetSpirvEmitter::runObject(StringRef ModuleId, std::vector<uint8_t> &Ou
     ResourceJson.push_back(std::move(Item));
   }
   raw_string_ostream Stream(Manifest);
-  Stream << json::Value(json::Object{{"formatVersion", 2}, {"valueAbiVersion", 1}, {"moduleId", ObjectModuleId}, {"entryComponentId", EntryComponent},
+  Stream << json::Value(json::Object{{"formatVersion", 3}, {"valueAbiVersion", 1}, {"moduleId", ObjectModuleId}, {"entryComponentId", EntryComponent},
+      {"preserveFloatingPointOrder", Precise},
       {"programId", ProgramId.empty() ? json::Value(nullptr) : json::Value(ProgramId)},
       {"functions", std::move(FunctionsJson)}, {"resources", std::move(ResourceJson)}, {"tables", std::move(TableJson)}, {"uses", std::move(Uses)}, {"typeContracts", json::Object{}}});
   return finish(Output);

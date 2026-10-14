@@ -238,6 +238,7 @@ bool ProphetSpirvEmitter::constantBuffer(const HLSLBufferDecl *D) {
   return Diagnostic.empty();
 }
 bool ProphetSpirvEmitter::global(const VarDecl *D) {
+  if (isRayQuery(D->getType())) return fail("RayQuery must be a function-local variable", D->getLocation());
   if (shaderAttribute(D, "table"))
     return true;
   if (shaderAttribute(D, "resource")) {

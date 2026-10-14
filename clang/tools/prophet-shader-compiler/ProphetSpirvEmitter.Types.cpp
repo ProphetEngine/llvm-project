@@ -59,6 +59,9 @@ uint32_t ProphetSpirvEmitter::vectorType(uint32_t Element, uint32_t Count) {
 }
 uint32_t ProphetSpirvEmitter::arrayType(uint32_t Element, uint32_t Count,
                                        SpirvLayout Layout, bool Runtime, const SpirvType *ElementLayout) {
+  if (Types[Element].K == SpirvType::RayQuery) {
+    fail("RayQuery cannot be stored in an array"); return 0;
+  }
   SpirvType Physical = ElementLayout ? *ElementLayout : physicalType(Element, Layout);
   uint32_t Align = Physical.Align;
   if (Layout == SpirvLayout::Uniform) Align = std::max(16u, Align);
@@ -167,7 +170,13 @@ uint32_t ProphetSpirvEmitter::type(QualType T, SpirvLayout Layout) {
   auto Key = std::make_tuple(T.getAsOpaquePtr(), Layout, RowMajor);
   if (auto I = ASTTypes.find(Key); I != ASTTypes.end()) return I->second;
   uint32_t Result = 0;
-  if (T->isVoidType()) Result = voidType();
+  if (isRayQuery(T)) {
+    if (Layout != SpirvLayout::Natural) { fail("RayQuery is function-local opaque state, not resource memory"); return 0; }
+    capability(Capability::RayQueryKHR); extension("SPV_KHR_ray_query");
+    SpirvType Info; Info.K = SpirvType::RayQuery;
+    Result = internType(OpTypeRayQueryKHR, {}, Info);
+  }
+  else if (T->isVoidType()) Result = voidType();
   else if (T->isBooleanType()) Result = Layout == SpirvLayout::Natural ? boolType() : integerType();
   else if (T->isIntegerType() || T->isEnumeralType())
     Result = integerType(uint32_t(Ctx.getTypeSize(T)), T->isSignedIntegerOrEnumerationType());
@@ -225,6 +234,9 @@ uint32_t ProphetSpirvEmitter::type(QualType T, SpirvLayout Layout) {
       }
     }
     for (const FieldDecl *F : R->fields()) {
+      if (isRayQuery(F->getType())) {
+        fail("RayQuery cannot be stored in a record field", F->getLocation()); return 0;
+      }
       if (F->isBitField() || F->getType()->isPointerType() || F->getType()->isReferenceType()) {
         fail("stored shader pointer/reference and bitfield members require an explicit buffer ABI", F->getLocation());
         return 0;
@@ -404,6 +416,9 @@ SpirvValue ProphetSpirvEmitter::address(SpirvValue V) {
   return V;
 }
 SpirvValue ProphetSpirvEmitter::load(SpirvValue V) {
+  if (Types[V.Type].K == SpirvType::RayQuery) {
+    fail("RayQuery is opaque local state and cannot be loaded or copied"); return {};
+  }
   if (!V.MatrixComponents.empty()) {
     auto Components = std::move(V.MatrixComponents); V.MatrixComponents.clear();
     auto Swizzle = std::move(V.Swizzle); V.Swizzle.clear();
@@ -471,6 +486,8 @@ SpirvValue ProphetSpirvEmitter::load(SpirvValue V) {
   return V;
 }
 bool ProphetSpirvEmitter::store(SpirvValue Target, SpirvValue Value) {
+  if (Types[Target.Type].K == SpirvType::RayQuery || Types[Value.Type].K == SpirvType::RayQuery)
+    return fail("RayQuery cannot be copied or assigned; use TraceRayInline to initialize its state");
   if (Target.Storage == StorageClass::Input || Target.Storage == StorageClass::Uniform)
     return fail("cannot write a read-only shader input or constant buffer");
   for (const auto &R : Resources)

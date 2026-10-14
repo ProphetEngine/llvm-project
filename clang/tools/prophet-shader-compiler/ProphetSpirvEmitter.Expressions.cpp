@@ -350,6 +350,18 @@ SpirvValue ProphetSpirvEmitter::arithmetic(BinaryOperatorKind Op, SpirvValue A,
     uint32_t Product = valueOp(OpIMul, Operand, {Quotient, B.Id});
     return {valueOp(OpISub, T, {A.Id, Product}), T, 7, Result};
   }
+  if (BinaryOperator::isComparisonOp(Op)) {
+    uint32_t Bool = Types[Operand].K == SpirvType::Vector ? vectorType(boolType(), Types[Operand].Count) : boolType();
+    SpirvValue Comparison{valueOp(Code, Bool, {A.Id, B.Id}), Bool};
+    // Clang represents an ext-vector comparison as integer lanes. SPIR-V
+    // comparisons still require a boolean result and an explicit conversion.
+    if (!Ctx.getLangOpts().HLSL && Types[T].K == SpirvType::Vector && Types[Types[T].Element].K == SpirvType::Int) {
+      uint32_t Element = Types[T].Element;
+      uint32_t True = composite(T, std::vector<uint32_t>(Types[T].Count, constant(Element, ~uint64_t(0))), true);
+      return {valueOp(OpSelect, T, {Comparison.Id, True, zero(T)}), T, 7, Result};
+    }
+    return convert(Comparison, T, Result);
+  }
   return {valueOp(Code, T, {A.Id, B.Id}), T, 7, Result};
 }
 SpirvValue ProphetSpirvEmitter::binary(const BinaryOperator *E) {
@@ -468,6 +480,8 @@ SpirvValue ProphetSpirvEmitter::call(const CallExpr *E) {
       store(Object, Args[0]); return Object;
     }
   std::string Name = F->getNameAsString();
+  if (Object.Type && Types[Object.Type].K == SpirvType::RayQuery)
+    return rayQueryCall(Name, Object, E, Args);
   bool Handled = false;
   if (Object.Resource) {
     SpirvValue R = resourceCall(Name, Object, E, Args, Handled);

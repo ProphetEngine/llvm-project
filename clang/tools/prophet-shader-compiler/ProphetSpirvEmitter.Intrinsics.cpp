@@ -66,6 +66,11 @@ SpirvValue ProphetSpirvEmitter::intrinsic(StringRef Name, const CallExpr *E,
   if (Name.starts_with("Interlocked")) {
     if (Args.size() < 2) { fail("atomic operation requires a target and value", E->getExprLoc()); return {}; }
     SpirvValue Target = address(Args[0]);
+    if (Target.Swizzle.size() == 1 && Types[Target.Type].K == SpirvType::Vector) {
+      uint32_t Component = Target.Swizzle.front(), Element = Types[Target.Type].Element;
+      Target.Swizzle.clear();
+      Target = access(Target, {constant(integerType(), Component)}, Target.ASTType, Element);
+    }
     if (!Target.Address) { fail("atomic target must be a shader lvalue", E->getExprLoc()); return {}; }
     if (Target.Storage != StorageClass::StorageBuffer && Target.Storage != StorageClass::Workgroup) {
       fail("atomic target must be a storage buffer or groupshared lvalue", E->getExprLoc()); return {};
@@ -237,19 +242,65 @@ SpirvValue ProphetSpirvEmitter::intrinsic(StringRef Name, const CallExpr *E,
     return Result(valueOp(Name == "countbits" ? OpBitCount : OpBitReverse, T, {ID(0)}));
   if (Name == "isnan" || Name == "isinf")
     return Result(valueOp(Name == "isnan" ? OpIsNan : OpIsInf, T, {ID(0)}));
+  if (Name == "isfinite") {
+    uint32_t Value = ID(0), Nan = valueOp(OpIsNan, T, {Value}), Inf = valueOp(OpIsInf, T, {Value});
+    return Result(valueOp(OpLogicalNot, T, {valueOp(OpLogicalOr, T, {Nan, Inf})}));
+  }
+  if (Name == "rcp") {
+    uint32_t Element = Types[T].K == SpirvType::Vector ? Types[T].Element : T;
+    uint64_t Bits = Types[Element].Bits == 64 ? 0x3ff0000000000000ull : 0x3f800000u;
+    SpirvValue One = convert({constant(Element, Bits), Element}, T);
+    return Result(valueOp(OpFDiv, T, {One.Id, ID(0)}));
+  }
+  if (Name == "f16tof32" || Name == "f32tof16") {
+    SpirvValue Input = Arg(0);
+    uint32_t Count = Types[T].K == SpirvType::Vector ? Types[T].Count : 1;
+    uint32_t InElement = Types[Input.Type].K == SpirvType::Vector ? Types[Input.Type].Element : Input.Type;
+    uint32_t F32 = floatType(), U32 = integerType(), F2 = vectorType(F32, 2);
+    std::vector<uint32_t> Values;
+    for (uint32_t I = 0; I < Count; ++I) {
+      uint32_t V = Count == 1 ? Input.Id : valueOp(OpCompositeExtract, InElement, {Input.Id, I});
+      if (Name == "f16tof32") {
+        uint32_t Pair = extOp(GLSL::UnpackHalf2x16, F2, {V});
+        Values.push_back(valueOp(OpCompositeExtract, F32, {Pair, 0}));
+      } else {
+        uint32_t Pair = composite(F2, {V, zero(F32)});
+        Values.push_back(extOp(GLSL::PackHalf2x16, U32, {Pair}));
+      }
+    }
+    return Result(Count == 1 ? Values.front() : composite(T, Values));
+  }
   if (Name == "any" || Name == "all") {
     SpirvValue V = Arg(0); uint32_t Count = Types[V.Type].Count;
     V = convert(V, Count ? vectorType(boolType(), Count) : boolType());
     return Result(Count ? valueOp(Name == "any" ? OpAny : OpAll, T, {V.Id}) : V.Id);
   }
   if (Name == "dot") return Result(valueOp(OpDot, T, {ID(0), ID(1)}));
+  if (Name == "sign") {
+    // HLSL returns int/intN even for floating operands. Selecting GLSL SSign
+    // from the result type is invalid; ordered input comparisons also retain
+    // HLSL's zero result for signed zero and unordered (NaN) operands.
+    SpirvValue V = Arg(0);
+    SpirvType Input = Types[V.Type];
+    uint32_t BT = Input.K == SpirvType::Vector ? vectorType(boolType(), Input.Count) : boolType();
+    SpirvType Scalar = Input.K == SpirvType::Vector ? Types[Input.Element] : Input;
+    uint32_t Element = Types[T].K == SpirvType::Vector ? Types[T].Element : T;
+    SpirvValue One = convert({constant(integerType(), 1), integerType()}, T);
+    uint32_t Positive = valueOp(Scalar.K == SpirvType::Float ? OpFOrdGreaterThan : Scalar.Signed ? OpSGreaterThan : OpUGreaterThan,
+                                BT, {V.Id, zero(V.Type)});
+    uint32_t P = valueOp(OpSelect, T, {Positive, One.Id, zero(T)});
+    if (Scalar.K != SpirvType::Float && !Scalar.Signed) return Result(P);
+    uint32_t Negative = valueOp(Scalar.K == SpirvType::Float ? OpFOrdLessThan : OpSLessThan, BT, {V.Id, zero(V.Type)});
+    uint32_t N = valueOp(OpSelect, T, {Negative, One.Id, zero(T)});
+    return Result(valueOp(Types[Element].K == SpirvType::Float ? OpFSub : OpISub, T, {P, N}));
+  }
   if (Name == "transpose") return matrixTranspose(Args[0], E->getType());
   if (Name == "mul") return matrixMultiply(Args[0], Args[1], E->getType());
   SpirvType Scalar = Types[T]; if (Scalar.K == SpirvType::Vector) Scalar = Types[Scalar.Element];
   bool Float = Scalar.K == SpirvType::Float, Signed = Scalar.Signed;
   uint32_t Ext = StringSwitch<uint32_t>(Name)
       .Case("round", GLSL::RoundEven).Case("trunc", GLSL::Trunc)
-      .Case("abs", Float ? GLSL::FAbs : GLSL::SAbs).Case("sign", Float ? GLSL::FSign : GLSL::SSign)
+      .Case("abs", Float ? GLSL::FAbs : GLSL::SAbs)
       .Case("floor", GLSL::Floor).Case("ceil", GLSL::Ceil).Case("frac", GLSL::Fract)
       .Case("radians", GLSL::Radians).Case("degrees", GLSL::Degrees)
       .Case("sin", GLSL::Sin).Case("cos", GLSL::Cos).Case("tan", GLSL::Tan)

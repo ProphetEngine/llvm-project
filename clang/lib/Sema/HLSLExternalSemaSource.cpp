@@ -881,8 +881,7 @@ static void buildAtomicOverload(Sema &S, NamespaceDecl *NS, StringRef FuncName,
                                 LangAS DestAS, bool ThreeArg) {
   ASTContext &AST = S.getASTContext();
 
-  QualType DestTy =
-      AST.getLValueReferenceType(AST.getAddrSpaceQualType(ElemTy, DestAS));
+  QualType DestTy = AST.getLValueReferenceType(ElemTy);
   QualType OrigRefTy = AST.getLValueReferenceType(ElemTy);
 
   SmallVector<QualType, 3> ParamTypes;
@@ -891,7 +890,15 @@ static void buildAtomicOverload(Sema &S, NamespaceDecl *NS, StringRef FuncName,
   if (ThreeArg)
     ParamTypes.push_back(OrigRefTy);
 
+  // Atomic destinations are HLSL inout lvalues, including vector components.
+  // Plain C++ references reject a UAV uint4 component before the SPIR-V
+  // backend can retain its storage-buffer address.
+  SmallVector<FunctionType::ExtParameterInfo, 3> ParamExtInfos(ParamTypes.size());
+  ParamExtInfos[0] = ParamExtInfos[0].withABI(ParameterABI::HLSLInOut);
+  if (ThreeArg)
+    ParamExtInfos[2] = ParamExtInfos[2].withABI(ParameterABI::HLSLOut);
   FunctionProtoType::ExtProtoInfo EPI;
+  EPI.ExtParameterInfos = ParamExtInfos.data();
   QualType FuncTy = AST.getFunctionType(AST.VoidTy, ParamTypes, EPI);
   auto *TSInfo = AST.getTrivialTypeSourceInfo(FuncTy, SourceLocation());
 
@@ -912,6 +919,10 @@ static void buildAtomicOverload(Sema &S, NamespaceDecl *NS, StringRef FuncName,
         AST, FD, SourceLocation(), SourceLocation(), &PII, ParamType,
         AST.getTrivialTypeSourceInfo(ParamType, SourceLocation()), SC_None,
         nullptr);
+    if (I == 0 || I == 2)
+      Parm->addAttr(HLSLParamModifierAttr::Create(
+          AST, SourceRange(), I == 0 ? HLSLParamModifierAttr::Keyword_inout
+                                    : HLSLParamModifierAttr::Keyword_out));
     Parm->setScopeInfo(0, I++);
     ParmDecls.push_back(Parm);
   }
@@ -939,7 +950,10 @@ static void defineHLSLInterlockedFunc(Sema &S, NamespaceDecl *NS,
                                     AST.UnsignedLongTy};
   if (SupportsFloat)
     Elems.push_back(AST.FloatTy);
-  LangAS AddrSpaces[] = {LangAS::hlsl_groupshared, LangAS::hlsl_device};
+  // HLSL inout conversion preserves the actual argument for atomic lowering,
+  // but drops its address space during overload resolution. One generic
+  // lvalue overload avoids equally viable device/groupshared signatures.
+  LangAS AddrSpaces[] = {LangAS::Default};
 
   for (QualType ElemTy : Elems)
     for (LangAS AS : AddrSpaces) {

@@ -4060,6 +4060,8 @@ static bool CheckArgAddrSpaceOneOf(Sema *S, CallExpr *TheCall,
                                    unsigned ArgIndex,
                                    ArrayRef<LangAS> AllowedSpaces) {
   Expr *Arg = TheCall->getArg(ArgIndex);
+  if (auto *Out = dyn_cast<HLSLOutArgExpr>(Arg->IgnoreParens()))
+    Arg = Out->getArgLValue();
   QualType LValueTy = Arg->IgnoreCasts()->getType();
   if (llvm::is_contained(AllowedSpaces, LValueTy.getAddressSpace()))
     return false;

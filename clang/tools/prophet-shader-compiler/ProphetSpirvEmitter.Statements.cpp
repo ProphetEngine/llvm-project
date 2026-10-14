@@ -64,6 +64,18 @@ bool ProphetSpirvEmitter::declaration(const Decl *D) {
     if (needsDestruction(V->getType())) return fail("static shader objects must have trivial destruction", V->getLocation());
     return global(V);
   }
+  if (isRayQuery(V->getType()) && !V->getType()->isReferenceType()) {
+    if (V->hasInit()) {
+      const Expr *Init = V->getInit()->IgnoreParenImpCasts();
+      const auto *Construct = dyn_cast<CXXConstructExpr>(Init);
+      const auto *List = dyn_cast<InitListExpr>(Init);
+      if (!isa<ImplicitValueInitExpr>(Init) && !(Construct && Construct->getNumArgs() == 0)
+          && !(List && List->getNumInits() == 0))
+        return fail("RayQuery cannot be copy-initialized; use TraceRayInline", V->getLocation());
+    }
+    Locals[V->getCanonicalDecl()] = temporary(V->getType(), V->getName());
+    return Diagnostic.empty();
+  }
   if (V->getType()->isReferenceType()) {
     if (!V->hasInit()) return fail("shader reference requires an initializer", V->getLocation());
     SpirvValue Init = expression(V->getInit());
@@ -129,7 +141,12 @@ bool ProphetSpirvEmitter::statement(const Stmt *S) {
       if (Calls.back().Result && !store(Calls.back().Result, V)) return false;
     }
     if (!emitCleanups(Calls.back().CleanupDepth)) return false;
-    trackReturn(); branch(Calls.back().Merge); return true;
+    trackReturn();
+    store(Calls.back().Returned, {constantBool(true), boolType()});
+    uint32_t Target = Calls.back().Merge;
+    for (auto I = FlowTargets.rbegin(); I != FlowTargets.rend(); ++I)
+      if (I->second) { Target = I->first; break; }
+    branch(Target); return true;
   }
   if (isa<BreakStmt>(S)) {
     if (FlowTargets.empty()) return fail("break outside a structured construct", S->getBeginLoc());
@@ -166,10 +183,30 @@ bool ProphetSpirvEmitter::conditional(const IfStmt *S) {
   Body.emit(OpSelectionMerge, {Merge, 0});
   conditionalBranch(Condition.Id, Yes, No);
   ControlConditions.push_back(Condition.Id);
-  label(Yes); if (!scopedStatement(S->getThen())) return false; branch(Merge);
-  label(No); if (!scopedStatement(S->getElse())) return false; branch(Merge);
+  auto BeforeQueries = InitializedRayQueries;
+  label(Yes); if (!scopedStatement(S->getThen())) return false;
+  auto YesQueries = InitializedRayQueries; bool YesExits = Terminated; branch(Merge);
+  InitializedRayQueries = BeforeQueries;
+  label(No); if (!scopedStatement(S->getElse())) return false;
+  bool NoExits = Terminated; branch(Merge);
+  if (NoExits) InitializedRayQueries = YesQueries;
+  else if (!YesExits) {
+    for (auto I = InitializedRayQueries.begin(); I != InitializedRayQueries.end();)
+      if (!YesQueries.contains(*I)) I = InitializedRayQueries.erase(I); else ++I;
+  }
   ControlConditions.pop_back();
   label(Merge); return true;
+}
+void ProphetSpirvEmitter::propagateReturn() {
+  if (Calls.empty() || !Calls.back().Returned) return;
+  uint32_t Target = Calls.back().Merge;
+  for (auto I = FlowTargets.rbegin(); I != FlowTargets.rend(); ++I)
+    if (I->second) { Target = I->first; break; }
+  uint32_t Continue = id();
+  uint32_t Returned = load(Calls.back().Returned).Id;
+  Body.emit(OpSelectionMerge, {Continue, 0});
+  conditionalBranch(Returned, Target, Continue);
+  label(Continue);
 }
 bool ProphetSpirvEmitter::loop(const Stmt *S) {
   size_t Depth = Cleanups.size();
@@ -189,6 +226,7 @@ bool ProphetSpirvEmitter::loop(const Stmt *S) {
     Condition = D->getCond(); LoopBody = D->getBody();
   }
   uint32_t Header = id(), Check = id(), Block = id(), Continue = id(), Merge = id();
+  auto BeforeQueries = InitializedRayQueries;
   auto UniformGuard = std::make_shared<std::vector<uint32_t>>(); UniformLoops.push_back(UniformGuard);
   branch(Header); label(Header);
   Body.emit(OpLoopMerge, {Merge, Continue, 0}); branch(IsDo ? Block : Check);
@@ -212,11 +250,14 @@ bool ProphetSpirvEmitter::loop(const Stmt *S) {
   }
   else branch(Header);
   UniformLoops.pop_back();
+  InitializedRayQueries = BeforeQueries;
   label(Merge);
+  propagateReturn();
   bool Result = emitCleanups(Depth); Cleanups.resize(Depth);
   return Result;
 }
 bool ProphetSpirvEmitter::rangeFor(const CXXForRangeStmt *S) {
+  auto BeforeQueries = InitializedRayQueries;
   if (!statement(S->getInit())) return false;
   SpirvValue Range = expression(S->getRangeInit());
   const auto *A = Ctx.getAsConstantArrayType(S->getRangeInit()->getType());
@@ -246,12 +287,13 @@ bool ProphetSpirvEmitter::rangeFor(const CXXForRangeStmt *S) {
   if (!scopedStatement(S->getBody())) return false;
   FlowTargets.pop_back(); branch(Continue); label(Continue);
   store(Index, {valueOp(OpIAdd, integerType(), {load(Index).Id, constant(integerType(), 1)}), integerType()});
-  branch(Header); UniformLoops.pop_back(); label(Merge); return Diagnostic.empty();
+  branch(Header); UniformLoops.pop_back(); InitializedRayQueries = BeforeQueries; label(Merge); propagateReturn(); return Diagnostic.empty();
 }
 bool ProphetSpirvEmitter::switchStmt(const SwitchStmt *S) {
   if (!statement(S->getInit())) return false;
   if (S->getConditionVariable() && !declaration(S->getConditionVariable())) return false;
   SpirvValue Selector = load(expression(S->getCond()));
+  auto BeforeQueries = InitializedRayQueries;
   struct Block { const SwitchCase *Case; uint32_t Label; std::vector<const Stmt *> Statements; };
   std::vector<Block> Blocks;
   std::function<void(const Stmt *)> Collect = [&](const Stmt *Node) {
@@ -283,6 +325,9 @@ bool ProphetSpirvEmitter::switchStmt(const SwitchStmt *S) {
   FlowTargets.emplace_back(Merge, 0);
   FlowCleanupDepth[Merge] = Cleanups.size();
   for (size_t I = 0; I < Blocks.size(); ++I) {
+    // Every case can be entered directly; initialization in another case is
+    // not a proof even when the emitted source also permits fallthrough.
+    InitializedRayQueries = BeforeQueries;
     label(Blocks[I].Label);
     for (const Stmt *Node : Blocks[I].Statements) {
       if (const auto *DS = dyn_cast<DeclStmt>(Node))
@@ -293,10 +338,13 @@ bool ProphetSpirvEmitter::switchStmt(const SwitchStmt *S) {
     }
     branch(I + 1 < Blocks.size() ? Blocks[I + 1].Label : Merge);
   }
-  FlowTargets.pop_back(); ControlConditions.pop_back(); label(Merge); return true;
+  FlowTargets.pop_back(); ControlConditions.pop_back(); InitializedRayQueries = BeforeQueries; label(Merge); return true;
 }
 SpirvValue ProphetSpirvEmitter::callFunction(const FunctionDecl *F,
     ArrayRef<SpirvValue> Args, SpirvValue Object) {
+  if (isRayQuery(F->getReturnType())) {
+    fail("RayQuery cannot be returned from a shader function", F->getLocation()); return {};
+  }
   if (ObjectMode && isObjectBoundary(F) &&
       (!Calls.empty() || !CurrentFunction || F->getCanonicalDecl() != CurrentFunction->getCanonicalDecl()))
     return objectCall(F, Args);
@@ -312,6 +360,8 @@ SpirvValue ProphetSpirvEmitter::callFunction(const FunctionDecl *F,
   auto SavedFlow = FlowTargets;
   FlowTargets.clear();
   CallFrame Frame; Frame.Function = F; Frame.Merge = id(); Frame.This = Object;
+  Frame.Returned = temporary(Ctx.BoolTy, "return.pending");
+  store(Frame.Returned, {constantBool(false), boolType()});
   Frame.CleanupDepth = Cleanups.size();
   if (needsDestruction(F->getReturnType())) {
     fail("shader helper return values must have trivial destruction; return data or use an output reference", F->getLocation()); return {};

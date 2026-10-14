@@ -15,6 +15,7 @@ add_clang_library(prophet_shader_compiler SHARED
   ProphetSpirvEmitter.Uniformity.cpp
   ProphetSpirvEmitter.AdvancedStages.cpp
   ProphetSpirvEmitter.Intrinsics.cpp
+  ProphetSpirvEmitter.RayQuery.cpp
   ProphetSpirvEmitter.Images.cpp
 
   DEPENDS

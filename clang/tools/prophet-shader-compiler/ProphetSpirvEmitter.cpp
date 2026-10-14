@@ -208,7 +208,7 @@ void ProphetSpirvEmitter::findTaskPayloads(const DeclContext *DC) {
   // An entry has exactly one payload interface even with several dispatch sites.
   if (TaskPayloadDecls.size() > 1) TaskPayloadDecls.clear();
 }
-bool ProphetSpirvEmitter::run(std::vector<uint8_t> &Output) {
+bool ProphetSpirvEmitter::sourceUsesPrecise() const {
   std::function<bool(const Decl *)> PreciseDecl;
   std::function<bool(const Stmt *)> PreciseStmt = [&](const Stmt *S) {
     if (!S) return false;
@@ -225,7 +225,10 @@ bool ProphetSpirvEmitter::run(std::vector<uint8_t> &Output) {
       for (const Decl *Child : DC->decls()) if (PreciseDecl(Child)) return true;
     return false;
   };
-  Precise = PreciseDecl(Ctx.getTranslationUnitDecl());
+  return PreciseDecl(Ctx.getTranslationUnitDecl());
+}
+bool ProphetSpirvEmitter::run(std::vector<uint8_t> &Output) {
+  Precise = sourceUsesPrecise();
   capability(Capability::Shader);
   if (RequestedStage == 7) findTaskPayloads(Ctx.getTranslationUnitDecl());
   std::function<void(const DeclContext *)> ReserveBindings = [&](const DeclContext *DC) {

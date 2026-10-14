@@ -42,4 +42,19 @@ __attribute__((clang_builtin_alias(__builtin_hlsl_dispatch_mesh)))
 void DispatchMesh(uint x, uint y, uint z, ...);
 #endif
 
+// Intrinsic declarations used by the typed AST backend. The implementation is
+// emitted as SPIR-V, including the required resource address for atomics.
+bool isfinite(float value);
+bool2 isfinite(float2 value);
+bool3 isfinite(float3 value);
+bool4 isfinite(float4 value);
+bool isfinite(double value);
+bool2 isfinite(double2 value);
+bool3 isfinite(double3 value);
+bool4 isfinite(double4 value);
+template<typename T>
+void InterlockedCompareExchange(inout T destination, T compare, T value, out T original);
+template<typename T>
+void InterlockedCompareStore(inout T destination, T compare, T value);
+
 #endif // _HLSL_HLSL_SPIRV_H_

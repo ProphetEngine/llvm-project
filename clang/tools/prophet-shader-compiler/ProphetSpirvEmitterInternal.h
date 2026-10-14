@@ -33,7 +33,7 @@ struct SpirvWords {
 enum class SpirvLayout { Natural, Storage, Uniform };
 struct SpirvType {
   enum Kind { Void, Bool, Int, Float, Vector, Matrix, Array, RuntimeArray,
-              Struct, Image, Sampler, Acceleration } K = Void;
+              Struct, Image, Sampler, Acceleration, RayQuery } K = Void;
   uint32_t Bits = 0, Element = 0, Count = 0, Size = 0, Align = 1, MatrixStride = 0;
   bool Signed = false, RowMajor = false, NativeMatrix = false;
   uint32_t Rows = 0;
@@ -146,6 +146,7 @@ class ProphetSpirvEmitter {
   struct CallFrame {
     const clang::FunctionDecl *Function = nullptr;
     SpirvValue Result;
+    SpirvValue Returned;
     uint32_t Merge = 0;
     size_t CleanupDepth = 0;
     std::vector<uint32_t> ReturnConditions;
@@ -154,10 +155,15 @@ class ProphetSpirvEmitter {
     std::shared_ptr<SpirvClosure> Closure;
   };
   std::vector<CallFrame> Calls;
+  void propagateReturn();
   uint32_t NextInput = 0, NextOutput = 0;
   uint32_t GeometryStream = 0, MeshVertices = 0, MeshIndices = 0;
   SpirvValue MeshPayload;
   std::map<std::pair<uint32_t, uint32_t>, SpirvValue> RaySlots;
+  std::set<uint32_t> InitializedRayQueries;
+  bool isRayQuery(QualType T) const;
+  SpirvValue rayQueryCall(StringRef Name, SpirvValue Object,
+                          const clang::CallExpr *E, llvm::ArrayRef<SpirvValue> Args);
   SpirvValue raySlot(SpirvValue Value, uint32_t Storage, StringRef Name);
   std::set<const clang::VarDecl *> TaskPayloadDecls;
   void findTaskPayloads(const clang::DeclContext *DC);
@@ -259,6 +265,7 @@ class ProphetSpirvEmitter {
   void branch(uint32_t Id);
   void conditionalBranch(uint32_t Condition, uint32_t Yes, uint32_t No);
   void scan(const clang::DeclContext *DC);
+  bool sourceUsesPrecise() const;
   bool global(const clang::VarDecl *D);
   bool resource(const clang::VarDecl *D);
   bool constantBuffer(const clang::HLSLBufferDecl *D);
