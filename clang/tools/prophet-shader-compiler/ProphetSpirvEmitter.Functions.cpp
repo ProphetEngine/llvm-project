@@ -1,6 +1,7 @@
 //===-- ProphetSpirvEmitter.Functions.cpp - Stage phase functions ---------===//
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #include "ProphetSpirvEmitterInternal.h"
+#include "llvm/ADT/ScopeExit.h"
 
 namespace prophet {
 using namespace spv;
@@ -11,6 +12,13 @@ uint32_t ProphetSpirvEmitter::isolatedFunction(StringRef Name,
   auto SavedLocals = std::move(Locals);
   auto SavedCalls = std::move(Calls);
   auto SavedFlow = std::move(FlowTargets);
+  auto SavedOpaque = std::move(OpaqueValues);
+  auto SavedOwners = std::move(InitializerOpaqueValues);
+  OpaqueValues.clear(); InitializerOpaqueValues.clear();
+  auto RestoreOpaque = llvm::scope_exit([&] {
+    OpaqueValues = std::move(SavedOpaque);
+    InitializerOpaqueValues = std::move(SavedOwners);
+  });
   uint32_t SavedLabel = CurrentLabel;
   bool SavedTerminated = Terminated;
   Body = {}; LocalVariables = {}; Locals.clear(); Calls.clear(); FlowTargets.clear();

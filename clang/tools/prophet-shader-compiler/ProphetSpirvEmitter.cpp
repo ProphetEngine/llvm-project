@@ -1,6 +1,7 @@
 //===-- ProphetSpirvEmitter.cpp - Shared AST module construction ----------===//
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #include "ProphetSpirvEmitterInternal.h"
+#include "prophet_shader_compiler.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/AST/HLSLResource.h"
 #include "llvm/ADT/StringExtras.h"
@@ -208,27 +209,60 @@ void ProphetSpirvEmitter::findTaskPayloads(const DeclContext *DC) {
   // An entry has exactly one payload interface even with several dispatch sites.
   if (TaskPayloadDecls.size() > 1) TaskPayloadDecls.clear();
 }
-bool ProphetSpirvEmitter::sourceUsesPrecise() const {
+bool ProphetSpirvEmitter::sourceUsesPrecise(bool &FloatingPointPragma) const {
   std::function<bool(const Decl *)> PreciseDecl;
   std::function<bool(const Stmt *)> PreciseStmt = [&](const Stmt *S) {
     if (!S) return false;
+    // Clang retains explicit pragma overrides even when their value equals the
+    // language default. Inspect those masks, not the effective/default FP mode.
+    FPOptionsOverride FP;
+    if (const auto *B = dyn_cast<BinaryOperator>(S)) FP = B->getStoredFPFeaturesOrDefault();
+    else if (const auto *U = dyn_cast<UnaryOperator>(S)) FP = U->getStoredFPFeaturesOrDefault();
+    else if (const auto *C = dyn_cast<CallExpr>(S)) FP = C->getStoredFPFeaturesOrDefault();
+    else if (const auto *C = dyn_cast<CastExpr>(S)) FP = C->getStoredFPFeaturesOrDefault();
+    else if (const auto *V = dyn_cast<ConvertVectorExpr>(S)) FP = V->getStoredFPFeaturesOrDefault();
+    else if (const auto *C = dyn_cast<CompoundStmt>(S)) FP = C->getStoredFPFeaturesOrDefault();
+    FloatingPointPragma |= FP.requiresTrailingStorage();
     if (const auto *DS = dyn_cast<DeclStmt>(S))
       for (const Decl *D : DS->decls()) if (PreciseDecl(D)) return true;
     for (const Stmt *Child : S->children()) if (PreciseStmt(Child)) return true;
     return false;
   };
   PreciseDecl = [&](const Decl *D) {
-    if (!D || D->isImplicit() || Ctx.getSourceManager().isInSystemHeader(D->getLocation())) return false;
+    if (!D || D->isImplicit()) return false;
     if (D->hasAttr<HLSLPreciseAttr>()) return true;
+    // A template itself is not a DeclContext. Inspect its authored declaration
+    // even before instantiation, including headers supplied through -isystem.
+    // Header search classification cannot weaken an explicit source contract.
+    if (const auto *T = dyn_cast<TemplateDecl>(D))
+      if (PreciseDecl(T->getTemplatedDecl())) return true;
     if (const auto *F = dyn_cast<FunctionDecl>(D)) if (PreciseStmt(F->getBody())) return true;
+    if (const auto *V = dyn_cast<VarDecl>(D)) if (PreciseStmt(V->getInit())) return true;
+    if (const auto *F = dyn_cast<FieldDecl>(D))
+      if (F->hasInClassInitializer() && PreciseStmt(F->getInClassInitializer())) return true;
     if (const auto *DC = dyn_cast<DeclContext>(D))
       for (const Decl *Child : DC->decls()) if (PreciseDecl(Child)) return true;
     return false;
   };
   return PreciseDecl(Ctx.getTranslationUnitDecl());
 }
+bool ProphetSpirvEmitter::selectFloatingPointContract() {
+  bool SourcePragma = false;
+  bool SourcePrecise = sourceUsesPrecise(SourcePragma);
+  bool NativeArithmetic = CompileFlags & PROPHET_SHADER_NATIVE_FLOATING_POINT;
+  if (SourcePragma && NativeArithmetic)
+    return fail("native floating-point mode cannot override an explicit floating-point pragma; compile this source with FastMath disabled");
+  if (SourcePrecise && NativeArithmetic)
+    return fail("native floating-point mode cannot override explicit precise; compile this source with FastMath disabled");
+  // Shader C++ retains its strict object default on both entry paths. Pure
+  // HLSL retains its established source-level precise contract. Explicit
+  // native arithmetic is selected before emitting any operation or metadata.
+  Precise = SourcePrecise || SourcePragma || (!NativeArithmetic &&
+      (!Ctx.getLangOpts().HLSL || Ctx.getLangOpts().HLSLCPlusPlus));
+  return true;
+}
 bool ProphetSpirvEmitter::run(std::vector<uint8_t> &Output) {
-  Precise = sourceUsesPrecise();
+  if (!selectFloatingPointContract()) return false;
   capability(Capability::Shader);
   if (RequestedStage == 7) findTaskPayloads(Ctx.getTranslationUnitDecl());
   std::function<void(const DeclContext *)> ReserveBindings = [&](const DeclContext *DC) {

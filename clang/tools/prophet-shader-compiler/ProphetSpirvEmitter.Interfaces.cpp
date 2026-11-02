@@ -44,7 +44,17 @@ SpirvValue ProphetSpirvEmitter::interfaceAddress(SpirvValue V) {
     std::vector<uint32_t> Indices;
     if (First) Indices.push_back(V.InterfacePath[0]);
     uint32_t Type = I.Type;
-    for (size_t P = First + I.Path.size(); P < V.InterfacePath.size(); ++P) {
+    size_t Tail = First + I.Path.size();
+    if (I.DistanceOffset != ~0u) {
+      uint32_t Plane = constant(integerType(), I.DistanceOffset);
+      if (Types[Type].K == SpirvType::Vector) {
+        if (Tail == V.InterfacePath.size()) { fail("clip/cull vectors require component addresses"); return {}; }
+        uint32_t Component = V.InterfacePath[Tail++];
+        Plane = I.DistanceOffset ? valueOp(OpIAdd, integerType(), {Plane, Component}) : Component;
+      }
+      Indices.push_back(Plane); Type = floatType();
+    }
+    for (size_t P = Tail; P < V.InterfacePath.size(); ++P) {
       Indices.push_back(V.InterfacePath[P]);
       Type = Types[Type].K == SpirvType::Struct
           ? Types[Type].Members[Literal(V.InterfacePath[P])] : Types[Type].Element;
@@ -59,8 +69,32 @@ SpirvValue ProphetSpirvEmitter::interfaceAddress(SpirvValue V) {
   }
   fail("shader stage subobject has no interface binding"); return {};
 }
+bool ProphetSpirvEmitter::splitDistanceInterface(SpirvValue V) {
+  for (const auto &I : Interfaces) {
+    if (I.Decl != V.Interface || I.Storage != V.Storage || I.DistanceOffset == ~0u ||
+        Types[I.Type].K != SpirvType::Vector) continue;
+    unsigned First = I.ArraySize && !I.Patch ? 1 : 0;
+    if (V.InterfacePath.size() != First + I.Path.size()) continue;
+    bool Match = true;
+    for (size_t P = 0; P < I.Path.size(); ++P) {
+      bool Same = false;
+      for (const auto &[Key, Id] : ConstantKeys)
+        if (Id == V.InterfacePath[First + P] && Key[0] == OpConstant && Key.size() >= 3 && Key[2] == I.Path[P]) Same = true;
+      Match &= Same;
+    }
+    if (Match) return true;
+  }
+  return false;
+}
 SpirvValue ProphetSpirvEmitter::loadInterface(SpirvValue V) {
   const auto Info = Types[V.Type];
+  if (splitDistanceInterface(V)) {
+    uint32_t NativeType = intrinsicType(V.ASTType), Count = Types[NativeType].Count;
+    std::vector<uint32_t> Values;
+    for (uint32_t I = 0; I < Count; ++I)
+      Values.push_back(loadInterface(access(V, {constant(integerType(), I)}, componentType(V.ASTType, I), floatType())).Id);
+    return convert({composite(NativeType, Values), NativeType}, V.Type, V.ASTType);
+  }
   if (const auto *R = V.ASTType.getNonReferenceType()->getAsRecordDecl();
       R && !shaderAnnotation(R, "prophet.vector:").empty())
     return convert(load(interfaceAddress(V)), V.Type, V.ASTType);
@@ -77,6 +111,15 @@ SpirvValue ProphetSpirvEmitter::loadInterface(SpirvValue V) {
 }
 bool ProphetSpirvEmitter::storeInterface(SpirvValue Target, SpirvValue Value) {
   const auto Info = Types[Target.Type];
+  if (splitDistanceInterface(Target)) {
+    uint32_t NativeType = intrinsicType(Target.ASTType), Count = Types[NativeType].Count;
+    Value = convert(Value, NativeType);
+    for (uint32_t I = 0; I < Count; ++I) {
+      SpirvValue Part{valueOp(OpCompositeExtract, floatType(), {Value.Id, I}), floatType()};
+      if (!storeInterface(access(Target, {constant(integerType(), I)}, componentType(Target.ASTType, I), floatType()), Part)) return false;
+    }
+    return true;
+  }
   if (const auto *R = Target.ASTType.getNonReferenceType()->getAsRecordDecl();
       R && !shaderAnnotation(R, "prophet.vector:").empty())
     return store(interfaceAddress(Target), Value);

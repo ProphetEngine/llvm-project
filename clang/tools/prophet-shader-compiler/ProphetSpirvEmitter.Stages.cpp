@@ -120,21 +120,62 @@ bool ProphetSpirvEmitter::interface(const ValueDecl *D, QualType T, uint32_t Sto
   } else if (Upper.starts_with("SV_") && Upper != "SV_TARGET")
     return fail("unsupported shader interface semantic: " + Semantic, D ? D->getLocation() : SourceLocation());
   if (Builtin == BuiltIn::TessCoord) Type = vectorType(floatType(), 3);
+  // HLSL permits scalar or shortened vector spellings; Vulkan defines these
+  // built-ins as uint3. interfaceInput converts to the requested source shape.
+  if (Builtin == BuiltIn::GlobalInvocationId || Builtin == BuiltIn::WorkgroupId ||
+      Builtin == BuiltIn::LocalInvocationId)
+    Type = vectorType(integerType(), 3);
   if (Builtin == BuiltIn::VertexIndex || Builtin == BuiltIn::InstanceIndex ||
       Builtin == BuiltIn::PrimitiveId || Builtin == BuiltIn::InvocationId ||
       Builtin == BuiltIn::SampleId || Builtin == BuiltIn::Layer || Builtin == BuiltIn::ViewportIndex)
     Type = integerType(32, true);
-  uint32_t ElementType = Type;
+  uint32_t ElementType = Type, DistanceOffset = ~0u;
+  bool Distance = Builtin == BuiltIn::ClipDistance || Builtin == BuiltIn::CullDistance;
+  bool ExistingDistance = Distance && Builtins.count({CurrentEntry, Builtin, Storage});
+  if (Distance) {
+    if (Primitive) return fail("clip/cull distances are per-vertex outputs", D->getLocation());
+    // Semantic fields are separate in HLSL, but SPIR-V has one float array for
+    // all planes (inside the per-vertex array in mesh/tessellation stages).
+    std::map<uint32_t, uint32_t> Widths;
+    std::set<const RecordDecl *> Visited;
+    std::function<void(const ValueDecl *, QualType)> Gather = [&](const ValueDecl *Decl, QualType Q) {
+      Q = Q.getNonReferenceType();
+      std::string S = semantic(Decl);
+      StringRef Name(S);
+      while (!Name.empty() && isDigit(Name.back())) Name = Name.drop_back();
+      if (Name.upper() == Upper) {
+        auto Info = Types[intrinsicType(Q)];
+        uint32_t Width = Info.K == SpirvType::Vector ? Info.Count : 1;
+        Widths[semanticIndex(S)] = std::max(Widths[semanticIndex(S)], Width);
+        return;
+      }
+      while (const auto *A = Ctx.getAsArrayType(Q)) Q = A->getElementType();
+      if (Q->isHLSLResourceRecord()) return;
+      if (const auto *Record = Q->getAsRecordDecl(); Record && Visited.insert(Record).second)
+        for (const auto *Field : Record->fields()) Gather(Field, Field->getType());
+    };
+    Gather(CurrentFunction, CurrentFunction->getReturnType());
+    for (const auto *P : CurrentFunction->parameters()) Gather(P, P->getOriginalType());
+    uint32_t SemanticIndex = semanticIndex(Semantic);
+    Widths[SemanticIndex] = Types[ElementType].K == SpirvType::Vector ? Types[ElementType].Count : 1;
+    uint32_t Total = 0;
+    for (auto [Index, Width] : Widths) {
+      if (Index == SemanticIndex) DistanceOffset = Total;
+      Total += Width;
+    }
+    if (!Total || Total > 8) return fail("clip/cull distance arrays support at most eight planes", D->getLocation());
+    Type = arrayType(floatType(), Total, SpirvLayout::Natural);
+  }
   if (ArraySize && !Patch) Type = arrayType(Type, ArraySize, SpirvLayout::Natural);
-  uint32_t V = Builtin != ~0u && !ArraySize
+  uint32_t V = Builtin != ~0u && (!ArraySize || Distance)
       ? builtin(Builtin, Type, Storage)
       : globalVariable(Type, Storage, (Storage == StorageClass::Input ? "in." : "out.") + Semantic);
   if (Builtin != ~0u) Builtins[{CurrentEntry, Builtin, Storage}] = V;
   std::string Retained = StringRef(Semantic).upper();
   if (!isDigit(Retained.back()) && (!StringRef(Retained).starts_with("SV_") || Upper == "SV_TARGET")) Retained += "0";
   if (Environment == 1) extension("SPV_GOOGLE_hlsl_functionality1");
-  Decorations.string(OpDecorate, {V, Decoration::UserSemantic}, Retained);
-  if (Builtin != ~0u) { if (ArraySize) decorate(V, Decoration::BuiltIn, {Builtin}); }
+  if (!ExistingDistance) Decorations.string(OpDecorate, {V, Decoration::UserSemantic}, Distance ? Upper : Retained);
+  if (Builtin != ~0u) { if (ArraySize && !Distance) decorate(V, Decoration::BuiltIn, {Builtin}); }
   else {
     uint32_t Location = 0;
     if (const auto *A = D ? D->getAttr<HLSLVkLocationAttr>() : nullptr) Location = A->getLocation();
@@ -150,9 +191,14 @@ bool ProphetSpirvEmitter::interface(const ValueDecl *D, QualType T, uint32_t Sto
     Next = std::max(Next, Location + Slots(ElementType));
     decorate(V, Decoration::Location, {Location});
     // Names retain semantic identity even when each stage has a different AST.
-    if (Storage == StorageClass::Input && CurrentStage == 3) {
+    // Explicit interpolation belongs to both sides of a stage interface. DXIL
+    // also uses it when packing signatures; dropping it on a producer can make
+    // an otherwise matching vertex/fragment pair incompatible.
+    if (D && hasShaderAnnotation(D, "prophet.nointerpolation"))
+      decorate(V, Decoration::Flat);
+    else if (Storage == StorageClass::Input && CurrentStage == 3) {
       SpirvType Scalar = Types[ElementType]; if (Scalar.K == SpirvType::Vector) Scalar = Types[Scalar.Element];
-      if (Scalar.K == SpirvType::Int || Primitive || (D && hasShaderAnnotation(D, "prophet.nointerpolation")))
+      if (Scalar.K == SpirvType::Int || Primitive)
         decorate(V, Decoration::Flat);
     }
   }
@@ -161,13 +207,32 @@ bool ProphetSpirvEmitter::interface(const ValueDecl *D, QualType T, uint32_t Sto
   if (D && hasShaderAnnotation(D, "prophet.noperspective")) decorate(V, Decoration::NoPerspective);
   if (D && hasShaderAnnotation(D, "prophet.centroid")) decorate(V, Decoration::Centroid);
   if (D && hasShaderAnnotation(D, "prophet.sample")) { decorate(V, Decoration::Sample); capability(Capability::SampleRateShading); }
-  Interfaces.push_back({D, T, std::move(Path), V, ElementType, Storage, ArraySize, Patch, Primitive, Semantic});
+  Interfaces.push_back({D, T, std::move(Path), V, ElementType, Storage, ArraySize, Patch, Primitive, Semantic, DistanceOffset});
   UsedGlobals.insert(V); return Diagnostic.empty();
 }
 SpirvValue ProphetSpirvEmitter::interfaceInput(const ValueDecl *D, QualType T, uint32_t Index) {
   SpirvValue Result = temporary(T);
   for (const auto &I : Interfaces) {
     if (I.Decl != D || I.Storage != StorageClass::Input) continue;
+    if (I.DistanceOffset != ~0u) {
+      SpirvValue Destination = Result;
+      if (!I.Path.empty()) {
+        std::vector<uint32_t> Path;
+        for (uint32_t P : I.Path) Path.push_back(constant(integerType(), P));
+        Destination = access(Result, Path, I.ASTType);
+      }
+      uint32_t Width = Types[I.Type].K == SpirvType::Vector ? Types[I.Type].Count : 1;
+      std::vector<uint32_t> Values;
+      for (uint32_t C = 0; C < Width; ++C) {
+        std::vector<uint32_t> Indices{I.Variable};
+        if (I.ArraySize && !I.Patch) Indices.push_back(Index ? Index : constant(integerType(), 0));
+        Indices.push_back(constant(integerType(), I.DistanceOffset + C));
+        uint32_t Pointer = valueOp(OpAccessChain, pointerType(floatType(), I.Storage), Indices);
+        Values.push_back(load({Pointer, floatType(), I.Storage, Ctx.FloatTy, true}).Id);
+      }
+      store(Destination, {Width == 1 ? Values[0] : composite(I.Type, Values), I.Type});
+      continue;
+    }
     SpirvValue Input{I.Variable, I.Type, StorageClass::Input, I.ASTType, true};
     if (I.ArraySize && !I.Patch) {
       Input = {valueOp(OpAccessChain, pointerType(I.Type, StorageClass::Input),
@@ -199,6 +264,19 @@ bool ProphetSpirvEmitter::interfaceOutput(const ValueDecl *D, SpirvValue V, uint
         for (uint32_t P : I.Path) Path.push_back(constant(integerType(), P));
         Source = access(V, Path, I.ASTType);
       } else Source = extract(V, I.Path, I.ASTType);
+    }
+    if (I.DistanceOffset != ~0u) {
+      Source = convert(Source, I.Type, I.ASTType);
+      uint32_t Width = Types[I.Type].K == SpirvType::Vector ? Types[I.Type].Count : 1;
+      for (uint32_t C = 0; C < Width; ++C) {
+        std::vector<uint32_t> Indices{I.Variable};
+        if (I.ArraySize && !I.Patch) Indices.push_back(Index ? Index : constant(integerType(), 0));
+        Indices.push_back(constant(integerType(), I.DistanceOffset + C));
+        uint32_t Pointer = valueOp(OpAccessChain, pointerType(floatType(), I.Storage), Indices);
+        SpirvValue Part = Width == 1 ? Source : SpirvValue{valueOp(OpCompositeExtract, floatType(), {Source.Id, C}), floatType()};
+        if (!store({Pointer, floatType(), I.Storage, Ctx.FloatTy, true}, Part)) return false;
+      }
+      continue;
     }
     SpirvValue Output{I.Variable, I.Type, StorageClass::Output, I.ASTType, true};
     if (I.ArraySize && !I.Patch)

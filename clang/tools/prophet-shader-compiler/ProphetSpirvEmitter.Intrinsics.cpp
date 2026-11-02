@@ -24,6 +24,16 @@ SpirvValue ProphetSpirvEmitter::intrinsic(StringRef Name, const CallExpr *E,
   auto Scope = [&](uint32_t S) { return constant(integerType(), S); };
   std::vector<uint32_t> IDs;
 
+  if (Name == "select") {
+    if (Args.size() != 3) { fail("select requires a condition and two values", E->getExprLoc()); return {}; }
+    SpirvValue Condition = Arg(0);
+    uint32_t ConditionType = Types[Condition.Type].K == SpirvType::Vector
+        ? vectorType(boolType(), Types[Condition.Type].Count) : boolType();
+    Condition = convert(Condition, ConditionType);
+    SpirvValue TrueValue = convert(Arg(1), T), FalseValue = convert(Arg(2), T);
+    return Result(valueOp(OpSelect, T, {Condition.Id, TrueValue.Id, FalseValue.Id}));
+  }
+
   uint32_t BI = StringSwitch<uint32_t>(Name)
       .Case("DispatchRaysIndex", BuiltIn::LaunchIdKHR).Case("DispatchRaysDimensions", BuiltIn::LaunchSizeKHR)
       .Case("WorldRayOrigin", BuiltIn::WorldRayOriginKHR).Case("WorldRayDirection", BuiltIn::WorldRayDirectionKHR)
@@ -66,14 +76,33 @@ SpirvValue ProphetSpirvEmitter::intrinsic(StringRef Name, const CallExpr *E,
   if (Name.starts_with("Interlocked")) {
     if (Args.size() < 2) { fail("atomic operation requires a target and value", E->getExprLoc()); return {}; }
     SpirvValue Target = address(Args[0]);
+    if (Target.Resource && Target.Resource->K == SpirvResource::StorageTexture && Target.ImageCoordinate) {
+      SpirvResource &R = *Target.Resource;
+      if (!Target.Address || R.Multisample || !Target.Swizzle.empty() ||
+          R.ElementType->isVectorType() || Types[R.Element].K != SpirvType::Int) {
+        fail("image atomics require an addressable scalar integer storage texel", E->getExprLoc()); return {};
+      }
+      if (R.ImageFormat != ImageFormat::R32i && R.ImageFormat != ImageFormat::R32ui &&
+          R.ImageFormat != ImageFormat::R64i && R.ImageFormat != ImageFormat::R64ui) {
+        fail("integer image atomics require r32i, r32ui, r64i or r64ui storage format", E->getExprLoc()); return {};
+      }
+      UsedGlobals.insert(R.Heap ? R.Heap : R.Variable);
+      uint32_t Pointer = R.Heap
+          ? valueOp(OpUntypedImageTexelPointerEXT, internType(OpTypeUntypedPointerKHR, {StorageClass::Image}, {}),
+              {R.Type, Target.Id, Target.ImageCoordinate, constant(integerType(), 0)})
+          : valueOp(OpImageTexelPointer, pointerType(R.Element, StorageClass::Image),
+              {Target.Id, Target.ImageCoordinate, constant(integerType(), 0)});
+      Target = {Pointer, R.Element, StorageClass::Image, R.ElementType, true};
+    }
     if (Target.Swizzle.size() == 1 && Types[Target.Type].K == SpirvType::Vector) {
       uint32_t Component = Target.Swizzle.front(), Element = Types[Target.Type].Element;
       Target.Swizzle.clear();
       Target = access(Target, {constant(integerType(), Component)}, Target.ASTType, Element);
     }
     if (!Target.Address) { fail("atomic target must be a shader lvalue", E->getExprLoc()); return {}; }
-    if (Target.Storage != StorageClass::StorageBuffer && Target.Storage != StorageClass::Workgroup) {
-      fail("atomic target must be a storage buffer or groupshared lvalue", E->getExprLoc()); return {};
+    if (Target.Storage != StorageClass::StorageBuffer && Target.Storage != StorageClass::Workgroup &&
+        Target.Storage != StorageClass::Image) {
+      fail("atomic target must be a storage buffer, storage image or groupshared lvalue", E->getExprLoc()); return {};
     }
     if (Types[Target.Type].K != SpirvType::Int || (Types[Target.Type].Bits != 32 && Types[Target.Type].Bits != 64)) {
       fail("atomic target requires a 32-bit or 64-bit integer", E->getExprLoc()); return {};
@@ -271,11 +300,38 @@ SpirvValue ProphetSpirvEmitter::intrinsic(StringRef Name, const CallExpr *E,
     return Result(Count == 1 ? Values.front() : composite(T, Values));
   }
   if (Name == "any" || Name == "all") {
-    SpirvValue V = Arg(0); uint32_t Count = Types[V.Type].Count;
+    SpirvValue V = Arg(0);
+    if (Types[V.Type].K == SpirvType::Matrix) {
+      const SpirvType Shape = Types[V.Type];
+      uint32_t Reduced = 0;
+      for (uint32_t Column = 0; Column < Shape.Count; ++Column)
+        for (uint32_t Row = 0; Row < Shape.Rows; ++Row) {
+          uint32_t Value = convert(matrixElement(V, Row, Column), boolType()).Id;
+          Reduced = Reduced ? valueOp(Name == "any" ? OpLogicalOr : OpLogicalAnd, boolType(), {Reduced, Value}) : Value;
+        }
+      return Result(Reduced);
+    }
+    uint32_t Count = Types[V.Type].Count;
     V = convert(V, Count ? vectorType(boolType(), Count) : boolType());
     return Result(Count ? valueOp(Name == "any" ? OpAny : OpAll, T, {V.Id}) : V.Id);
   }
-  if (Name == "dot") return Result(valueOp(OpDot, T, {ID(0), ID(1)}));
+  if (Name == "dot") {
+    SpirvValue Left = Arg(0), Right = Arg(1);
+    if (Types[T].K != SpirvType::Int && Types[Left.Type].K == SpirvType::Vector)
+      return Result(valueOp(OpDot, T, {Left.Id, Right.Id}));
+    uint32_t Count = Types[Left.Type].K == SpirvType::Vector ? Types[Left.Type].Count : 1;
+    uint32_t Sum = 0;
+    auto Lane = [&](SpirvValue Value, uint32_t Index) {
+      if (Types[Value.Type].K == SpirvType::Vector)
+        Value = {valueOp(OpCompositeExtract, Types[Value.Type].Element, {Value.Id, Index}), Types[Value.Type].Element};
+      return convert(Value, T).Id;
+    };
+    for (uint32_t Index = 0; Index < Count; ++Index) {
+      uint32_t Product = valueOp(Types[T].K == SpirvType::Int ? OpIMul : OpFMul, T, {Lane(Left, Index), Lane(Right, Index)});
+      Sum = Sum ? valueOp(Types[T].K == SpirvType::Int ? OpIAdd : OpFAdd, T, {Sum, Product}) : Product;
+    }
+    return Result(Sum);
+  }
   if (Name == "sign") {
     // HLSL returns int/intN even for floating operands. Selecting GLSL SSign
     // from the result type is invalid; ordered input comparisons also retain

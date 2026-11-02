@@ -183,7 +183,8 @@ bool Qualifiers::isTargetAddressSpaceSupersetOf(LangAS A, LangAS B,
   if (A == LangAS::Default &&
       (B == LangAS::hlsl_private || B == LangAS::hlsl_device ||
        B == LangAS::hlsl_input || B == LangAS::hlsl_output ||
-       B == LangAS::hlsl_push_constant))
+       B == LangAS::hlsl_push_constant || B == LangAS::hlsl_groupshared ||
+       B == LangAS::hlsl_constant))
     return true;
 
   // Conversions from target specific address spaces may be legal depending on

@@ -1,6 +1,7 @@
 //===-- ProphetSpirvEmitter.Statements.cpp - Structured AST control -------===//
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #include "ProphetSpirvEmitterInternal.h"
+#include "llvm/ADT/ScopeExit.h"
 
 using namespace clang;
 using namespace llvm;
@@ -98,6 +99,13 @@ bool ProphetSpirvEmitter::declaration(const Decl *D) {
     Locals[V->getCanonicalDecl()] = expression(V->getInit());
     return bool(Locals[V->getCanonicalDecl()]);
   }
+  if (V->getType()->isHLSLResourceRecord()) {
+    if (!V->hasInit()) return fail("local shader resources require a descriptor initializer", V->getLocation());
+    SpirvValue Init = expression(V->getInit());
+    if (!Init.Resource) return fail("local shader resource initializer lost descriptor provenance", V->getLocation());
+    Locals[V->getCanonicalDecl()] = Init;
+    return Diagnostic.empty();
+  }
   SpirvValue Address = temporary(V->getType(), V->getName());
   Locals[V->getCanonicalDecl()] = Address;
   if (V->hasInit() && !store(Address, expression(V->getInit()))) return false;
@@ -138,7 +146,15 @@ bool ProphetSpirvEmitter::statement(const Stmt *S) {
       SpirvValue V = expression(E);
       if (Calls.back().Function->getReturnType()->isReferenceType())
         return fail("runtime helper reference returns require a statically known alias", E->getExprLoc());
-      if (Calls.back().Result && !store(Calls.back().Result, V)) return false;
+      if (Calls.back().Function->getReturnType()->isHLSLResourceRecord()) {
+        if (!V.Resource) return fail("shader resource return lost descriptor provenance", E->getExprLoc());
+        SpirvValue &Previous = Calls.back().ResourceResult;
+        if (Previous.Resource && (bool(Previous.HeapIndex) != bool(V.HeapIndex) ||
+            (!V.HeapIndex && Previous.Resource != V.Resource)))
+          return fail("runtime resource returns must select logical indices in one typed descriptor heap", E->getExprLoc());
+        Previous = V;
+        if (V.HeapIndex && !store(Calls.back().Result, {V.HeapIndex, integerType()})) return false;
+      } else if (Calls.back().Result && !store(Calls.back().Result, V)) return false;
     }
     if (!emitCleanups(Calls.back().CleanupDepth)) return false;
     trackReturn();
@@ -163,7 +179,32 @@ bool ProphetSpirvEmitter::statement(const Stmt *S) {
       }
     return fail("continue outside a loop", S->getBeginLoc());
   }
-  if (const auto *A = dyn_cast<AttributedStmt>(S)) return statement(A->getSubStmt());
+  if (const auto *A = dyn_cast<AttributedStmt>(S)) {
+    const Stmt *Loop = A->getSubStmt();
+    while (const auto *Nested = dyn_cast<AttributedStmt>(Loop)) Loop = Nested->getSubStmt();
+    uint32_t Control = LoopControl::None;
+    bool Explicit = false;
+    for (const Attr *Attribute : A->getAttrs()) {
+      if (const auto *Hint = dyn_cast<HLSLLoopHintAttr>(Attribute)) {
+        Explicit = true;
+        // Numeric unroll factors are not a request for unrestricted full unroll.
+        if (Hint->getSemanticSpelling() == HLSLLoopHintAttr::Microsoft_loop)
+          Control = LoopControl::DontUnroll;
+        else if (Hint->getDirective() == 0) Control = LoopControl::Unroll;
+      } else if (const auto *Hint = dyn_cast<LoopHintAttr>(Attribute)) {
+        if (Hint->getOption() != LoopHintAttr::Unroll && Hint->getOption() != LoopHintAttr::UnrollCount) continue;
+        Explicit = true;
+        if (Hint->getState() == LoopHintAttr::Disable) Control = LoopControl::DontUnroll;
+        else if (Hint->getState() == LoopHintAttr::Enable || Hint->getState() == LoopHintAttr::Full)
+          Control = LoopControl::Unroll;
+      }
+    }
+    if (!Explicit) return statement(A->getSubStmt());
+    auto Saved = ExplicitLoopControls;
+    auto Restore = scope_exit([&] { ExplicitLoopControls = std::move(Saved); });
+    ExplicitLoopControls[Loop] = Control;
+    return statement(A->getSubStmt());
+  }
   if (const auto *L = dyn_cast<LabelStmt>(S)) return statement(L->getSubStmt());
   if (isa<NullStmt>(S)) return true;
   if (const auto *E = dyn_cast<Expr>(S)) { expression(E); return Diagnostic.empty(); }
@@ -208,6 +249,60 @@ void ProphetSpirvEmitter::propagateReturn() {
   conditionalBranch(Returned, Target, Continue);
   label(Continue);
 }
+uint32_t ProphetSpirvEmitter::loopControl(const Stmt *S) {
+  if (auto I = ExplicitLoopControls.find(S); I != ExplicitLoopControls.end()) return I->second;
+  const auto *F = dyn_cast<ForStmt>(S);
+  if (!F || !F->getInit() || !F->getCond() || !F->getInc()) return LoopControl::None;
+  const auto *Init = dyn_cast<DeclStmt>(F->getInit());
+  if (!Init || !Init->isSingleDecl()) return LoopControl::None;
+  const auto *Index = dyn_cast<VarDecl>(Init->getSingleDecl());
+  if (!Index || !Index->hasInit() || !Index->getType()->isIntegerType() ||
+      Index->getType().isVolatileQualified() || Ctx.getTypeSize(Index->getType()) != 32) return LoopControl::None;
+  auto IsIndex = [&](const Expr *E) {
+    const auto *R = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts());
+    return R && R->getDecl()->getCanonicalDecl() == Index->getCanonicalDecl();
+  };
+  Expr::EvalResult Start, Limit;
+  if (!Index->getInit()->EvaluateAsInt(Start, Ctx) || Start.Val.getInt() != 0) return LoopControl::None;
+  const auto *Condition = dyn_cast<BinaryOperator>(F->getCond()->IgnoreParenImpCasts());
+  const auto *Step = dyn_cast<UnaryOperator>(F->getInc()->IgnoreParenImpCasts());
+  if (!Condition || Condition->getOpcode() != BO_LT || !IsIndex(Condition->getLHS()) ||
+      !Condition->getRHS()->EvaluateAsInt(Limit, Ctx) || !Step || !Step->isIncrementOp() ||
+      !IsIndex(Step->getSubExpr())) return LoopControl::None;
+  uint64_t Count = Limit.Val.getInt().getLimitedValue();
+  if (Count < 2 || Count > 4) return LoopControl::None;
+  unsigned Nodes = 0;
+  bool DimensionAccess = false;
+  std::function<bool(const Stmt *)> Eligible = [&](const Stmt *Node) {
+    if (!Node) return true;
+    if (++Nodes > 96 || isa<ForStmt, WhileStmt, DoStmt, CXXForRangeStmt, BreakStmt,
+        ContinueStmt, ReturnStmt, GotoStmt, CallExpr, CXXConstructExpr>(Node)) return false;
+    if (const auto *U = dyn_cast<UnaryOperator>(Node)) {
+      if (U->getOpcode() == UO_AddrOf || U->getOpcode() == UO_Deref ||
+          (U->isIncrementDecrementOp() && IsIndex(U->getSubExpr()))) return false;
+    }
+    if (const auto *B = dyn_cast<BinaryOperator>(Node); B && B->isAssignmentOp() && IsIndex(B->getLHS())) return false;
+    if (const auto *D = dyn_cast<DeclStmt>(Node))
+      for (const Decl *Child : D->decls())
+        if (const auto *V = dyn_cast<VarDecl>(Child); V &&
+            (V->getType()->isReferenceType() || V->getType()->isPointerType() ||
+             V->getType().isVolatileQualified() || needsDestruction(V->getType()))) return false;
+    if (const auto *R = dyn_cast<DeclRefExpr>(Node); R && R->getType().isVolatileQualified()) return false;
+    if (const auto *A = dyn_cast<ArraySubscriptExpr>(Node)) {
+      QualType Base = A->getBase()->IgnoreParenImpCasts()->getType();
+      if (IsIndex(A->getIdx()) && (Base->isVectorType() || Ctx.getAsConstantArrayType(Base))) DimensionAccess = true;
+    }
+    for (const Stmt *Child : Node->children()) if (!Eligible(Child)) return false;
+    return true;
+  };
+  if (!Eligible(F->getBody()) || !DimensionAccess) return LoopControl::None;
+  unsigned Growth = Nodes * static_cast<unsigned>(Count);
+  // Bound both one expansion and cumulative expansion in this emitted module.
+  if (Growth > 256 || BoundedLoopGrowth + Growth > 1024) return LoopControl::None;
+  BoundedLoopGrowth += Growth;
+  return LoopControl::Unroll;
+}
+
 bool ProphetSpirvEmitter::loop(const Stmt *S) {
   size_t Depth = Cleanups.size();
   const Expr *Condition = nullptr, *Increment = nullptr;
@@ -229,7 +324,7 @@ bool ProphetSpirvEmitter::loop(const Stmt *S) {
   auto BeforeQueries = InitializedRayQueries;
   auto UniformGuard = std::make_shared<std::vector<uint32_t>>(); UniformLoops.push_back(UniformGuard);
   branch(Header); label(Header);
-  Body.emit(OpLoopMerge, {Merge, Continue, 0}); branch(IsDo ? Block : Check);
+  Body.emit(OpLoopMerge, {Merge, Continue, loopControl(S)}); branch(IsDo ? Block : Check);
   if (!IsDo) {
     label(Check);
     const VarDecl *Variable = nullptr;
@@ -268,7 +363,7 @@ bool ProphetSpirvEmitter::rangeFor(const CXXForRangeStmt *S) {
   SpirvValue Index = temporary(Ctx.UnsignedIntTy);
   store(Index, {constant(integerType(), 0), integerType()});
   uint32_t Header = id(), Check = id(), Block = id(), Continue = id(), Merge = id();
-  branch(Header); label(Header); Body.emit(OpLoopMerge, {Merge, Continue, 0}); branch(Check);
+  branch(Header); label(Header); Body.emit(OpLoopMerge, {Merge, Continue, loopControl(S)}); branch(Check);
   label(Check);
   uint32_t I = load(Index).Id;
   uint32_t Condition = valueOp(OpULessThan, boolType(),
@@ -358,6 +453,13 @@ SpirvValue ProphetSpirvEmitter::callFunction(const FunctionDecl *F,
   if (Args.size() != F->getNumParams()) { fail("shader helper argument count mismatch", F->getLocation()); return {}; }
   auto SavedLocals = Locals;
   auto SavedFlow = FlowTargets;
+  auto SavedOpaque = std::move(OpaqueValues);
+  auto SavedOwners = std::move(InitializerOpaqueValues);
+  OpaqueValues.clear(); InitializerOpaqueValues.clear();
+  auto RestoreOpaque = llvm::scope_exit([&] {
+    OpaqueValues = std::move(SavedOpaque);
+    InitializerOpaqueValues = std::move(SavedOwners);
+  });
   FlowTargets.clear();
   CallFrame Frame; Frame.Function = F; Frame.Merge = id(); Frame.This = Object;
   Frame.Returned = temporary(Ctx.BoolTy, "return.pending");
@@ -368,7 +470,7 @@ SpirvValue ProphetSpirvEmitter::callFunction(const FunctionDecl *F,
   }
   Frame.Closure = Object.Closure;
   if (!F->getReturnType()->isVoidType() && !F->getReturnType()->isReferenceType())
-    Frame.Result = temporary(F->getReturnType(), "return.value");
+    Frame.Result = temporary(F->getReturnType()->isHLSLResourceRecord() ? Ctx.UnsignedIntTy : F->getReturnType(), "return.value");
   std::vector<std::pair<SpirvValue, SpirvValue>> CopyOut;
   for (unsigned I = 0; I < Args.size(); ++I) {
     const ParmVarDecl *P = F->getParamDecl(I);
@@ -422,7 +524,15 @@ SpirvValue ProphetSpirvEmitter::callFunction(const FunctionDecl *F,
   if (const auto *Dtor = dyn_cast<CXXDestructorDecl>(F)) destroyMembers(Object, Dtor->getParent());
   for (auto [Target, Source] : CopyOut) store(Target, Source);
   Cleanups.resize(Frame.CleanupDepth);
+  SpirvValue ResourceResult = Calls.back().ResourceResult;
   Calls.pop_back(); Locals = std::move(SavedLocals); FlowTargets = std::move(SavedFlow);
+  if (ResourceResult.Resource) {
+    // Only the logical slot crosses the helper's control-flow merge. Opaque
+    // resources are never copied into function memory or merged as pointers.
+    if (ResourceResult.HeapIndex)
+      return descriptorHeapValue(ResourceResult.Resource, F->getReturnType(), load(Frame.Result));
+    return ResourceResult;
+  }
   return Frame.Result ? load(Frame.Result) : SpirvValue{};
 }
 }

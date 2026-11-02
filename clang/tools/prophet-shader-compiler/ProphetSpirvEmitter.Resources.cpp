@@ -6,6 +6,7 @@
 #include "clang/AST/RecordLayout.h"
 #include "clang/Basic/SourceManager.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSwitch.h"
 
 using namespace clang;
 using namespace llvm;
@@ -46,12 +47,14 @@ bool ProphetSpirvEmitter::binding(const NamedDecl *D, uint32_t &Set, uint32_t &S
     }
   }
   auto [It, Added] = Bindings.emplace(std::make_pair(Set, Slot), D);
+  if (!Added && !It->second)
+    return fail("shader binding collides with an associated structured-buffer counter", D->getLocation());
   if (!Added && It->second->getCanonicalDecl() != D->getCanonicalDecl())
     return fail(("SPIR-V descriptor set " + Twine(Set) + " binding " + Twine(Slot) +
        " is assigned to both " + cast<NamedDecl>(It->second)->getName() + " and " + D->getName() + "; use [[vk::binding(binding, set)]] or unique shader bindings").str(), D->getLocation());
   return true;
 }
-bool ProphetSpirvEmitter::resource(const VarDecl *D) {
+bool ProphetSpirvEmitter::resource(const VarDecl *D, SpirvResource **TypeOnly) {
   QualType T = D->getType().getNonReferenceType();
   uint32_t Count = 1;
   if (const auto *A = Ctx.getAsConstantArrayType(T)) {
@@ -66,7 +69,8 @@ bool ProphetSpirvEmitter::resource(const VarDecl *D) {
   bool Uniform = !shaderAnnotation(D, "prophet.uniform_buffer:").empty() || Name == "ConstantBuffer";
   bool IsBuffer = Storage || Uniform || Name == "StructuredBuffer" ||
       Name == "RWStructuredBuffer" || Name == "ByteAddressBuffer" || Name == "RWByteAddressBuffer";
-  bool IsTexture = StringRef(Name).contains("Texture");
+  bool IsTexelBuffer = Name == "Buffer" || Name == "RWBuffer";
+  bool IsTexture = IsTexelBuffer || StringRef(Name).contains("Texture");
   bool IsSampler = Name == "SamplerState" || Name == "SamplerComparisonState";
   bool IsAcceleration = Name == "RaytracingAccelerationStructure" || Name == "RayTracingAccelerationStructure";
   if (!IsBuffer && !IsTexture && !IsSampler && !IsAcceleration) return false;
@@ -78,7 +82,7 @@ bool ProphetSpirvEmitter::resource(const VarDecl *D) {
   if (needsDestruction(R.ElementType)) {
     fail("shader resource elements must have trivial destruction", D->getLocation()); return true;
   }
-  if (!binding(D, R.Set, R.Binding)) return true;
+  if (!TypeOnly && !binding(D, R.Set, R.Binding)) return true;
   uint32_t StorageClass = spv::StorageClass::UniformConstant;
   uint32_t VariableType = 0;
   if (IsBuffer) {
@@ -161,32 +165,81 @@ bool ProphetSpirvEmitter::resource(const VarDecl *D) {
     R.ReadOnly = R.K == SpirvResource::Texture;
     R.Arrayed = StringRef(Name).contains("Array");
     R.Multisample = StringRef(Name).contains("MS");
-    R.Dimension = StringRef(Name).contains("1D") ? Dim::_1D :
+    R.Dimension = IsTexelBuffer ? Dim::Buffer : StringRef(Name).contains("1D") ? Dim::_1D :
                   StringRef(Name).contains("3D") ? Dim::_3D :
                   StringRef(Name).contains("Cube") ? Dim::Cube : Dim::_2D;
     if (R.Dimension == Dim::_1D) capability(R.ReadOnly ? Capability::Sampled1D : Capability::Image1D);
+    if (IsTexelBuffer) capability(R.ReadOnly ? Capability::SampledBuffer : Capability::ImageBuffer);
     if (R.Dimension == Dim::Cube && R.Arrayed) capability(Capability::SampledCubeArray);
-    R.Depth = R.ElementType->isSpecificBuiltinType(BuiltinType::Float) && R.ReadOnly;
+    R.Depth = !IsTexelBuffer && R.ElementType->isSpecificBuiltinType(BuiltinType::Float) && R.ReadOnly;
     QualType Scalar = R.ElementType;
     if (const auto *V = Scalar->getAs<VectorType>()) Scalar = V->getElementType();
     R.Element = type(Scalar);
     uint32_t Width = 1;
     if (const auto *V = R.ElementType->getAs<VectorType>()) Width = V->getNumElements();
     uint32_t Format = ImageFormat::Unknown;
-    if (!R.ReadOnly) {
-      if (Width == 2) capability(Capability::StorageImageExtendedFormats);
-      Format = Scalar->isRealFloatingType()
-          ? (Width == 1 ? ImageFormat::R32f : Width == 2 ? ImageFormat::Rg32f : ImageFormat::Rgba32f)
-          : Scalar->isSignedIntegerType()
+    bool Image64 = Types[R.Element].K == SpirvType::Int && Types[R.Element].Bits == 64;
+    if (Image64) {
+      if (Width != 1) { fail("64-bit integer images require scalar texels", D->getLocation()); return true; }
+      extension("SPV_EXT_shader_image_int64");
+      capability(Capability::Int64ImageEXT);
+    }
+    // HLSL arithmetic precision does not specify texture storage precision.
+    // Float storage views may be R8/R11G11B10/RGBA16 as well as 32-bit formats.
+    // Preserve concrete integer defaults for addressable image atomics; callers
+    // can explicitly constrain a storage view with PROPHET_IMAGE_FORMAT.
+    if (!R.ReadOnly && !IsTexelBuffer && !Scalar->isRealFloatingType()) {
+      Format = Scalar->isSignedIntegerType()
           ? (Width == 1 ? ImageFormat::R32i : Width == 2 ? ImageFormat::Rg32i : ImageFormat::Rgba32i)
           : (Width == 1 ? ImageFormat::R32ui : Width == 2 ? ImageFormat::Rg32ui : ImageFormat::Rgba32ui);
+      if (Image64) Format = Scalar->isSignedIntegerType() ? ImageFormat::R64i : ImageFormat::R64ui;
     }
+    StringRef ExplicitFormat = shaderAnnotation(D, "prophet.image_format:");
+    if (!ExplicitFormat.empty()) {
+      if (R.ReadOnly) { fail("image format requires a writable storage texture or texel buffer", D->getLocation()); return true; }
+      Format = StringSwitch<uint32_t>(ExplicitFormat)
+          .Case("unknown", ImageFormat::Unknown)
+          .Case("r8", ImageFormat::R8).Case("r8_snorm", ImageFormat::R8Snorm)
+          .Case("rg8", ImageFormat::Rg8).Case("rgba8", ImageFormat::Rgba8)
+          .Case("r16f", ImageFormat::R16f).Case("rg16f", ImageFormat::Rg16f).Case("rgba16f", ImageFormat::Rgba16f)
+          .Case("r11f_g11f_b10f", ImageFormat::R11fG11fB10f)
+          .Case("r32f", ImageFormat::R32f).Case("rg32f", ImageFormat::Rg32f).Case("rgba32f", ImageFormat::Rgba32f)
+          .Case("r8ui", ImageFormat::R8ui).Case("r16ui", ImageFormat::R16ui)
+          .Case("r32ui", ImageFormat::R32ui).Case("rg32ui", ImageFormat::Rg32ui).Case("rgba32ui", ImageFormat::Rgba32ui)
+          .Case("r8i", ImageFormat::R8i).Case("r16i", ImageFormat::R16i)
+          .Case("r32i", ImageFormat::R32i).Case("rg32i", ImageFormat::Rg32i).Case("rgba32i", ImageFormat::Rgba32i)
+          .Case("r64ui", ImageFormat::R64ui).Case("r64i", ImageFormat::R64i).Default(~0u);
+      if (Format == ~0u) { fail("unknown storage image format annotation", D->getLocation()); return true; }
+      if (Format != ImageFormat::Unknown) {
+        bool FloatFormat = Format <= ImageFormat::R8Snorm;
+        bool SignedFormat = (Format >= ImageFormat::Rgba32i && Format <= ImageFormat::R8i) || Format == ImageFormat::R64i;
+        bool WideFormat = Format == ImageFormat::R64i || Format == ImageFormat::R64ui;
+        if (FloatFormat != Scalar->isRealFloatingType() ||
+            (!FloatFormat && SignedFormat != Scalar->isSignedIntegerType()) || WideFormat != Image64) {
+          fail("storage image format does not match the shader scalar type", D->getLocation()); return true;
+        }
+      }
+      if (Image64 && Format == ImageFormat::Unknown) {
+        fail("64-bit image accesses require an explicit r64ui or r64i format", D->getLocation()); return true;
+      }
+    }
+    if (Format != ImageFormat::Unknown && Format != ImageFormat::R32f && Format != ImageFormat::R32i &&
+        Format != ImageFormat::R32ui && Format != ImageFormat::Rgba32f && Format != ImageFormat::Rgba32i &&
+        Format != ImageFormat::Rgba32ui && Format != ImageFormat::Rgba16f && Format != ImageFormat::Rgba8 &&
+        Format != ImageFormat::Rgba8Snorm && !Image64)
+      capability(Capability::StorageImageExtendedFormats);
+    R.ImageFormat = Format;
     SpirvType Info; Info.K = SpirvType::Image; Info.Element = R.Element;
     R.Type = VariableType = internType(OpTypeImage,
         {R.Element, R.Dimension, uint32_t(R.Depth), uint32_t(R.Arrayed),
          uint32_t(R.Multisample), R.ReadOnly ? 1u : 2u, Format}, Info);
   }
   if (!Diagnostic.empty()) return true;
+  if (TypeOnly) {
+    *TypeOnly = Owned.get();
+    Resources.push_back(std::move(Owned));
+    return true;
+  }
   if (Count > 1) VariableType = arrayType(VariableType, Count, SpirvLayout::Natural);
   R.Variable = globalVariable(VariableType, StorageClass, D->getName());
   if (ObjectMode) ObjectResourceOwners[R.Variable] = D;
@@ -284,7 +337,7 @@ SpirvValue ProphetSpirvEmitter::resourceIndex(SpirvValue Object, SpirvValue Inde
                                              QualType T) {
   SpirvResource *R = Object.Resource;
   if (!R) return {};
-  UsedGlobals.insert(R->Variable); Index = load(Index);
+  UsedGlobals.insert(R->Heap ? R->Heap : R->Variable); Index = load(Index);
   if (R->Count > 1 && !Object.DescriptorSelected) {
     uint32_t P = valueOp(OpAccessChain, pointerType(R->Type, Object.Storage),
                         {R->Variable, Index.Id});
@@ -311,6 +364,21 @@ SpirvValue ProphetSpirvEmitter::resourceIndex(SpirvValue Object, SpirvValue Inde
   if (R->K == SpirvResource::StorageTexture) {
     Object.ImageCoordinate = Index.Id; Object.ASTType = T.getNonReferenceType();
     return Object;
+  }
+  if (R->K == SpirvResource::Texture) {
+    if (R->Multisample || R->Dimension == Dim::Cube) {
+      fail("indexed sampled texture access requires a non-multisample 1D, 2D or 3D image"); return {};
+    }
+    uint32_t Dimensions = (R->Dimension == Dim::_1D || R->Dimension == Dim::Buffer ? 1 : R->Dimension == Dim::_3D ? 3 : 2) + uint32_t(R->Arrayed);
+    uint32_t CoordinateType = Dimensions == 1 ? integerType(32, true) : vectorType(integerType(32, true), Dimensions);
+    uint32_t Coordinate = convert(Index, CoordinateType).Id;
+    uint32_t Image = load(Object).Id;
+    uint32_t Color = vectorType(R->Element, 4);
+    uint32_t Value = R->Dimension == Dim::Buffer
+        ? valueOp(OpImageFetch, Color, {Image, Coordinate})
+        : valueOp(OpImageFetch, Color, {Image, Coordinate, ImageOperands::Lod, constant(integerType(32, true), 0)});
+    QualType ResultType = T.getNonReferenceType();
+    return convert({Value, Color}, type(ResultType), ResultType);
   }
   fail("this resource does not support indexed element access"); return {};
 }

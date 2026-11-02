@@ -1,20 +1,149 @@
 //===-- ProphetSpirvEmitter.Images.cpp - Shared texture operations --------===//
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #include "ProphetSpirvEmitterInternal.h"
+#include "clang/AST/RecordLayout.h"
+#include <algorithm>
 
 using namespace clang;
 using namespace llvm;
 namespace prophet {
 using namespace spv;
 
+SpirvValue ProphetSpirvEmitter::rawBufferLoad(SpirvValue Resource,
+    SpirvValue ByteOffset, QualType ValueType) {
+  ByteOffset = convert(ByteOffset, integerType());
+  auto Offset = [&](uint32_t Base, uint64_t Bytes) {
+    return Bytes ? valueOp(OpIAdd, integerType(), {Base, constant(integerType(), Bytes)}) : Base;
+  };
+  auto Word = [&](uint32_t Bytes) {
+    uint32_t Index = valueOp(OpShiftRightLogical, integerType(), {Bytes, constant(integerType(), 2)});
+    return load(resourceIndex(Resource, {Index, integerType()}, Ctx.UnsignedIntTy));
+  };
+  std::function<SpirvValue(QualType, uint32_t)> Read = [&](QualType T, uint32_t Base) -> SpirvValue {
+    T = T.getNonReferenceType();
+    uint32_t Logical = type(T);
+    if (!Logical || !Diagnostic.empty()) return {};
+    if (const auto *Vector = T->getAs<VectorType>()) {
+      std::vector<uint32_t> Parts;
+      uint64_t Bytes = Ctx.getTypeSizeInChars(Vector->getElementType()).getQuantity();
+      for (unsigned I = 0; I < Vector->getNumElements(); ++I)
+        Parts.push_back(Read(Vector->getElementType(), Offset(Base, I * Bytes)).Id);
+      return {composite(Logical, Parts), Logical, 7, T};
+    }
+    if (const auto *Matrix = T->getAs<ConstantMatrixType>()) {
+      QualType Scalar = Matrix->getElementType();
+      uint32_t Rows = Matrix->getNumRows(), Columns = Matrix->getNumColumns();
+      uint64_t Bytes = Ctx.getTypeSizeInChars(Scalar).getQuantity();
+      bool RowMajor = isRowMajor(T);
+      std::vector<uint32_t> Parts;
+      for (uint32_t Column = 0; Column < Columns; ++Column) {
+        std::vector<uint32_t> Lanes;
+        for (uint32_t Row = 0; Row < Rows; ++Row)
+          Lanes.push_back(Read(Scalar, Offset(Base, (RowMajor ? Row * Columns + Column : Column * Rows + Row) * Bytes)).Id);
+        Parts.push_back(Rows == 1 ? Lanes[0] : composite(vectorType(type(Scalar), Rows), Lanes));
+      }
+      return {composite(Logical, Parts), Logical, 7, T};
+    }
+    if (const auto *Array = Ctx.getAsConstantArrayType(T)) {
+      std::vector<uint32_t> Parts;
+      uint64_t Bytes = Ctx.getTypeSizeInChars(Array->getElementType()).getQuantity();
+      for (uint64_t I = 0; I < Array->getSize().getLimitedValue(); ++I)
+        Parts.push_back(Read(Array->getElementType(), Offset(Base, I * Bytes)).Id);
+      return {composite(Logical, Parts), Logical, 7, T};
+    }
+    if (const auto *Record = T->getAsRecordDecl()) {
+      const auto &Layout = Ctx.getASTRecordLayout(Record);
+      std::vector<uint32_t> Parts;
+      if (const auto *Cxx = dyn_cast<CXXRecordDecl>(Record))
+        for (const auto &Parent : Cxx->bases())
+          Parts.push_back(Read(Parent.getType(), Offset(Base,
+              Layout.getBaseClassOffset(Parent.getType()->getAsCXXRecordDecl()).getQuantity())).Id);
+      for (const auto *Field : Record->fields())
+        Parts.push_back(Read(Field->getType(), Offset(Base, Layout.getFieldOffset(Field->getFieldIndex()) / 8)).Id);
+      return {composite(Logical, Parts), Logical, 7, T};
+    }
+    const auto Info = Types[Logical];
+    if (Info.K != SpirvType::Int && Info.K != SpirvType::Float && Info.K != SpirvType::Bool) {
+      fail("ByteAddressBuffer.Load<T> requires a trivially represented scalar, vector, matrix, array or POD"); return {};
+    }
+    SpirvValue Bits = Word(Base);
+    if (Info.K == SpirvType::Bool) return convert(Bits, Logical, T);
+    if (Info.Bits < 32) {
+      uint32_t ByteInWord = valueOp(OpBitwiseAnd, integerType(), {Base, constant(integerType(), 3)});
+      uint32_t Shift = valueOp(OpIMul, integerType(), {ByteInWord, constant(integerType(), 8)});
+      uint32_t Selected = valueOp(OpShiftRightLogical, integerType(), {Bits.Id, Shift});
+      Bits = {valueOp(OpUConvert, integerType(Info.Bits), {Selected}), integerType(Info.Bits)};
+    } else if (Info.Bits == 64) {
+      uint32_t Low = valueOp(OpUConvert, integerType(64), {Bits.Id});
+      uint32_t High = valueOp(OpUConvert, integerType(64), {Word(Offset(Base, 4)).Id});
+      High = valueOp(OpShiftLeftLogical, integerType(64), {High, constant(integerType(), 32)});
+      Bits = {valueOp(OpBitwiseOr, integerType(64), {Low, High}), integerType(64)};
+    }
+    return Bits.Type == Logical ? SpirvValue{Bits.Id, Logical, 7, T}
+        : SpirvValue{valueOp(OpBitcast, Logical, {Bits.Id}), Logical, 7, T};
+  };
+  return Read(ValueType, ByteOffset.Id);
+}
+
 SpirvValue ProphetSpirvEmitter::resourceCall(StringRef Name, SpirvValue Object,
     const CallExpr *E, ArrayRef<SpirvValue> Args, bool &Handled) {
   Handled = true;
   SpirvResource &R = *Object.Resource;
-  UsedGlobals.insert(R.Variable);
+  UsedGlobals.insert(R.Heap ? R.Heap : R.Variable);
   if (Name == "operator[]" && Args.size() == 1)
     return resourceIndex(Object, Args[0], E->getType());
   if (R.K == SpirvResource::Buffer) {
+    if (Name == "IncrementCounter" || Name == "DecrementCounter") {
+      if (R.ReadOnly || R.Uniform || R.Heap || R.Count != 1 || !Args.empty() ||
+          !R.Decl->getType()->getAsCXXRecordDecl() ||
+          R.Decl->getType()->getAsCXXRecordDecl()->getName() != "RWStructuredBuffer") {
+        fail("structured-buffer counters require one fixed RWStructuredBuffer resource", E->getExprLoc()); return {};
+      }
+      if (!R.Counter) {
+        uint32_t Slot = 0;
+        while (Bindings.contains({R.Set, Slot})) ++Slot;
+        Bindings.emplace(std::make_pair(R.Set, Slot), nullptr);
+        uint32_t Words = arrayType(integerType(), 0, SpirvLayout::Storage, true);
+        uint32_t Block = structType({Words}, SpirvLayout::Storage, true);
+        R.CounterBinding = Slot;
+        size_t CounterStart = GlobalVariables.Words.size();
+        R.Counter = globalVariable(Block, StorageClass::StorageBuffer,
+            (R.Decl->getName() + ".counter").str());
+        // OpDecorateId parameters must precede their target definition. Counter
+        // usage is discovered while lowering functions, after resource scanning.
+        for (size_t I = 0; I < CounterStart; I += GlobalVariables.Words[I] >> 16) {
+          if ((GlobalVariables.Words[I] & 0xffff) == OpVariable && GlobalVariables.Words[I + 2] == R.Variable) {
+            std::rotate(GlobalVariables.Words.begin() + I,
+                GlobalVariables.Words.begin() + CounterStart, GlobalVariables.Words.end());
+            break;
+          }
+        }
+        decorate(R.Counter, Decoration::DescriptorSet, {R.Set});
+        decorate(R.Counter, Decoration::Binding, {Slot});
+        extension("SPV_GOOGLE_hlsl_functionality1");
+        Decorations.emit(OpDecorateId, {R.Variable, Decoration::CounterBuffer, R.Counter});
+      }
+      UsedGlobals.insert(R.Counter);
+      uint32_t Zero = constant(integerType(), 0), One = constant(integerType(), 1);
+      uint32_t Pointer = valueOp(OpAccessChain, pointerType(integerType(), StorageClass::StorageBuffer),
+          {R.Counter, Zero, Zero});
+      uint32_t Previous = valueOp(Name == "IncrementCounter" ? OpAtomicIAdd : OpAtomicISub,
+          integerType(), {Pointer, constant(integerType(), Scope::Device), Zero, One});
+      uint32_t Result = Name == "IncrementCounter" ? Previous : valueOp(OpISub, integerType(), {Previous, One});
+      return {Result, integerType(), StorageClass::Function, E->getType()};
+    }
+    if (Name.starts_with("Interlocked")) {
+      QualType ResourceType = R.Decl->getType();
+      while (const auto *A = Ctx.getAsArrayType(ResourceType)) ResourceType = A->getElementType();
+      if (R.ReadOnly || !ResourceType->getAsCXXRecordDecl()->getName().contains("ByteAddress") || Args.size() < 2) {
+        fail("raw atomic methods require a writable byte-address buffer, byte offset and value", E->getExprLoc()); return {};
+      }
+      uint32_t Word = valueOp(OpShiftRightLogical, integerType(),
+          {load(Args[0]).Id, constant(integerType(), 2)});
+      std::vector<SpirvValue> AtomicArgs(Args.begin(), Args.end());
+      AtomicArgs[0] = resourceIndex(Object, {Word, integerType()}, R.ElementType);
+      return intrinsic(Name, E, AtomicArgs, Handled);
+    }
     if (R.Uniform && Args.empty() &&
         (Name == "Load" || isa<CXXConversionDecl>(E->getDirectCallee())))
       return access(Object, {constant(integerType(), 0)}, R.ElementType, R.Element);
@@ -24,11 +153,14 @@ SpirvValue ProphetSpirvEmitter::resourceCall(StringRef Name, SpirvValue Object,
       QualType ResourceType = R.Decl->getType();
       while (const auto *A = Ctx.getAsArrayType(ResourceType)) ResourceType = A->getElementType();
       std::string Class = ResourceType->getAsCXXRecordDecl()->getNameAsString();
+      if (Name == "Load" && StringRef(Class).contains("ByteAddress"))
+        return rawBufferLoad(Object, Args[0], E->getType());
       if (StringRef(Class).contains("ByteAddress"))
         Index = valueOp(OpShiftRightLogical, integerType(), {Index, constant(integerType(), 2)});
       std::vector<uint32_t> Values;
       SpirvValue Input;
-      if (Name.starts_with("Store")) Input = load(Args[1]);
+      if (Name.starts_with("Store"))
+        Input = convert(Args[1], Count == 1 ? R.Element : vectorType(R.Element, Count));
       for (uint32_t I = 0; I < Count; ++I) {
         uint32_t Offset = I ? valueOp(OpIAdd, integerType(), {Index, constant(integerType(), I)}) : Index;
         SpirvValue Pointer = resourceIndex(Object, {Offset, integerType()}, R.ElementType);
@@ -61,15 +193,17 @@ SpirvValue ProphetSpirvEmitter::resourceCall(StringRef Name, SpirvValue Object,
     // declaration and image type remain shared by both source languages.
     SpirvResource Selected = R;
     if (Object.DescriptorSelected) Selected.Variable = Object.Id;
-    return imageCall(Name, Selected, E, Args);
+    return imageCall(Name, Selected, E, Args, Object.Address ? 0 : Object.Id);
   }
   Handled = false; return {};
 }
 SpirvValue ProphetSpirvEmitter::imageCall(StringRef Name, SpirvResource &R,
-    const CallExpr *E, ArrayRef<SpirvValue> Args) {
-  uint32_t Image = valueOp(OpLoad, R.Type, {R.Variable});
+    const CallExpr *E, ArrayRef<SpirvValue> Args, uint32_t LoadedImage) {
+  // A resource passed by value may already be an OpLoad result. Preserve that
+  // opaque value; treating its SSA id as another descriptor pointer is invalid.
+  uint32_t Image = LoadedImage ? LoadedImage : valueOp(OpLoad, R.Type, {R.Variable});
   uint32_t T = E->getType()->isVoidType() ? 0 : type(E->getType());
-  uint32_t CoordinateCount = R.Dimension == Dim::_1D ? 1 :
+  uint32_t CoordinateCount = R.Dimension == Dim::_1D || R.Dimension == Dim::Buffer ? 1 :
       R.Dimension == Dim::_3D || R.Dimension == Dim::Cube ? 3 : 2;
   CoordinateCount += R.Arrayed;
   auto Coordinate = [&](SpirvValue V, uint32_t Count, bool Integer) {
@@ -91,12 +225,12 @@ SpirvValue ProphetSpirvEmitter::imageCall(StringRef Name, SpirvResource &R,
   };
   if (Name == "GetDimensions") {
     capability(Capability::ImageQuery);
-    uint32_t Dimensions = R.Dimension == Dim::_1D ? 1 : R.Dimension == Dim::_3D ? 3 : 2;
+    uint32_t Dimensions = R.Dimension == Dim::_1D || R.Dimension == Dim::Buffer ? 1 : R.Dimension == Dim::_3D ? 3 : 2;
     Dimensions += R.Arrayed;
-    bool HasLod = R.ReadOnly && !R.Multisample && Args.size() > Dimensions;
+    bool HasLod = R.Dimension != Dim::Buffer && R.ReadOnly && !R.Multisample && Args.size() > Dimensions;
     uint32_t QT = Dimensions == 1 ? integerType() : vectorType(integerType(), Dimensions);
     uint32_t Size;
-    if (R.ReadOnly && !R.Multisample)
+    if (R.Dimension != Dim::Buffer && R.ReadOnly && !R.Multisample)
       Size = valueOp(OpImageQuerySizeLod, QT, {Image, HasLod ? load(Args[0]).Id : constant(integerType(), 0)});
     else Size = valueOp(OpImageQuerySize, QT, {Image});
     unsigned First = HasLod ? 1 : 0;
@@ -116,11 +250,12 @@ SpirvValue ProphetSpirvEmitter::imageCall(StringRef Name, SpirvResource &R,
     SpirvValue Location = load(Args[0]);
     uint32_t Coord = Coordinate(Location, CoordinateCount, true);
     uint32_t Op = R.ReadOnly ? OpImageFetch : OpImageRead;
+    if (!R.ReadOnly && R.ImageFormat == ImageFormat::Unknown) capability(Capability::StorageImageReadWithoutFormat);
     std::vector<uint32_t> Operands{Image, Coord};
     if (R.Multisample) {
       if (Args.size() < 2) { fail("multisample Load requires a sample index", E->getExprLoc()); return {}; }
       Operands.push_back(ImageOperands::Sample); Operands.push_back(load(Args[1]).Id);
-    } else if (R.ReadOnly) {
+    } else if (R.ReadOnly && R.Dimension != Dim::Buffer) {
       uint32_t Lod = constant(integerType(32, true), 0);
       if (Types[Location.Type].K == SpirvType::Vector && Types[Location.Type].Count > CoordinateCount)
         Lod = valueOp(OpCompositeExtract, Types[Location.Type].Element, {Location.Id, CoordinateCount});

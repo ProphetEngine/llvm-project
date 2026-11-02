@@ -137,7 +137,7 @@ uint32_t ProphetSpirvEmitter::structType(ArrayRef<uint32_t> Members,
   }
   return T;
 }
-static bool isRowMajor(QualType T) {
+bool ProphetSpirvEmitter::isRowMajor(QualType T) {
   for (const clang::Type *Raw = T.getNonReferenceType().getTypePtr(); const auto *A = dyn_cast<AttributedType>(Raw); Raw = A->getModifiedType().getTypePtr()) {
     if (A->getAttrKind() == attr::HLSLRowMajor) return true;
     if (A->getAttrKind() == attr::HLSLColumnMajor) return false;
@@ -335,6 +335,44 @@ SpirvValue ProphetSpirvEmitter::constantExpr(const Expr *E) {
   if (E->getType()->isPointerType() || E->getType()->isReferenceType() ||
       E->isValueDependent()) return {};
   if (const auto *Record = E->getType()->getAsCXXRecordDecl(); Record && Record->isLambda()) return {};
+  // Clang's APValue evaluator does not currently represent HLSL matrix aggregate
+  // initializers. Assemble their constant scalar/vector elements explicitly,
+  // preserving HLSL row-ordered initializer syntax in SPIR-V column vectors.
+  if (E->getType()->getAs<ConstantMatrixType>()) {
+    if (const auto *List = dyn_cast<InitListExpr>(E->IgnoreParenImpCasts())) {
+      uint32_t Matrix = type(E->getType()), Scalar = matrixScalarType(Matrix);
+      const SpirvType Info = Types[Matrix];
+      std::vector<uint32_t> Elements;
+      std::function<bool(const Expr *)> Append = [&](const Expr *Part) {
+        if (const auto *Nested = dyn_cast<InitListExpr>(Part->IgnoreParenImpCasts())) {
+          for (const Expr *Item : Nested->inits()) if (!Append(Item)) return false;
+          return true;
+        }
+        SpirvValue Value = constantExpr(Part);
+        if (!Value) return false;
+        if (Value.Type == Scalar) { Elements.push_back(Value.Id); return true; }
+        const SpirvType Element = Types[Value.Type];
+        if (Element.K != SpirvType::Vector || Element.Element != Scalar) return false;
+        for (const auto &[Key, Id] : ConstantKeys) if (Id == Value.Id) {
+          if (Key[0] == OpConstantComposite) Elements.insert(Elements.end(), Key.begin() + 2, Key.end());
+          else if (Key[0] == OpConstantNull) Elements.insert(Elements.end(), Element.Count, zero(Scalar));
+          else return false;
+          return true;
+        }
+        return false;
+      };
+      for (const Expr *Part : List->inits()) if (!Append(Part)) return {};
+      if (Elements.size() > size_t(Info.Rows) * Info.Count) return {};
+      Elements.resize(size_t(Info.Rows) * Info.Count, zero(Scalar));
+      std::vector<uint32_t> Columns;
+      for (uint32_t Column = 0; Column < Info.Count; ++Column) {
+        std::vector<uint32_t> Rows;
+        for (uint32_t Row = 0; Row < Info.Rows; ++Row) Rows.push_back(Elements[Row * Info.Count + Column]);
+        Columns.push_back(composite(Info.Element, Rows, true));
+      }
+      return {composite(Matrix, Columns, true), Matrix, StorageClass::Function, E->getType()};
+    }
+  }
   Expr::EvalResult R;
   if (!E->EvaluateAsRValue(R, Ctx) || R.HasSideEffects ||
       (!R.Val.isInt() && !R.Val.isFloat() && !R.Val.isVector() && !R.Val.isArray() && !R.Val.isStruct()))
@@ -445,18 +483,26 @@ SpirvValue ProphetSpirvEmitter::load(SpirvValue V) {
   // retain this provenance; only resourceIndex produces a loadable element.
   // Loading the block here would also attempt to load its runtime-sized array.
   if (V.Resource && V.Resource->K == SpirvResource::Buffer) {
-    UsedGlobals.insert(V.Resource->Variable);
+    UsedGlobals.insert(V.Resource->Heap ? V.Resource->Heap : V.Resource->Variable);
     return V;
   }
   if (V.Resource && V.Resource->K != SpirvResource::Buffer) {
-    UsedGlobals.insert(V.Resource->Variable);
+    UsedGlobals.insert(V.Resource->Heap ? V.Resource->Heap : V.Resource->Variable);
     if (V.Address) V.Id = valueOp(OpLoad, V.Resource->Type, {V.Id});
     V.Type = V.Resource->Type; V.Address = false;
     if (V.ImageCoordinate) {
+      if (V.Resource->ImageFormat == ImageFormat::Unknown) capability(Capability::StorageImageReadWithoutFormat);
       uint32_t Color = vectorType(V.Resource->Element, 4);
       uint32_t Value = valueOp(OpImageRead, Color, {V.Id, V.ImageCoordinate});
-      SpirvValue Result{Value, Color, 7, V.ASTType};
-      return convert(Result, type(V.ASTType), V.ASTType);
+      // A projected image element still denotes the complete texel. Loading
+      // through the projected AST type would truncate .w/.zy to the first
+      // lanes before the projection has a chance to select its real lanes.
+      SpirvValue Result{Value, Color, 7, V.Resource->ElementType};
+      Result = convert(Result, type(V.Resource->ElementType), V.Resource->ElementType);
+      if (!Result) return {};
+      Result.Swizzle = std::move(V.Swizzle);
+      Result = load(Result); Result.ASTType = V.ASTType;
+      return Result;
     }
     return V;
   }
@@ -518,9 +564,51 @@ bool ProphetSpirvEmitter::store(SpirvValue Target, SpirvValue Value) {
   if (Target.Resource && Target.ImageCoordinate) {
     auto *R = Target.Resource;
     if (R->ReadOnly) return fail("cannot write a read-only shader resource");
+    if (!Target.Swizzle.empty()) {
+      auto Swizzle = std::move(Target.Swizzle); Target.Swizzle.clear();
+      // Merge into the logical resource element, not the swizzle's AST type
+      // or the opaque image-object SPIR-V type. Unselected lanes are reads.
+      Target.ASTType = R->ElementType;
+      uint32_t ElementType = type(R->ElementType);
+      unsigned Width = Types[ElementType].K == SpirvType::Vector ? Types[ElementType].Count : 1;
+      for (unsigned I = 0; I < Swizzle.size(); ++I) {
+        if (Swizzle[I] >= Width) return fail("image swizzle destination lane is out of range");
+        for (unsigned J = 0; J < I; ++J)
+          if (Swizzle[I] == Swizzle[J]) return fail("image swizzle write contains duplicate components");
+      }
+      if (Width == 1) return store(Target, Value);
+      // A complete permutation replaces every logical lane. Do not turn a
+      // write-only assignment into a read of potentially uninitialized data.
+      SpirvValue Original = Swizzle.size() == Width
+          ? SpirvValue{zero(ElementType), ElementType, 7, R->ElementType}
+          : load(Target);
+      Value = load(Value);
+      if (!Original || !Value) return false;
+      uint32_t Element = Types[ElementType].Element;
+      for (unsigned I = 0; I < Swizzle.size(); ++I) {
+        SpirvValue Part = Swizzle.size() == 1 ? Value
+            : SpirvValue{valueOp(OpCompositeExtract, Types[Value.Type].Element, {Value.Id, I}), Types[Value.Type].Element};
+        Part = convert(Part, Element);
+        if (!Part) return false;
+        Original.Id = valueOp(OpCompositeInsert, ElementType, {Part.Id, Original.Id, Swizzle[I]});
+      }
+      return store(Target, Original);
+    }
     SpirvValue ImageObject = Target; ImageObject.ImageCoordinate = 0;
     uint32_t Image = load(ImageObject).Id;
     Value = load(Value);
+    if (R->ImageFormat == ImageFormat::Unknown)
+      capability(Capability::StorageImageWriteWithoutFormat);
+    // OpImageWrite and the target HLSL/MSL image declarations use four
+    // components. Keep the authored lanes and fill only absent channels.
+    std::vector<uint32_t> Channels;
+    uint32_t ChannelCount = Types[Value.Type].K == SpirvType::Vector ? Types[Value.Type].Count : 1;
+    for (uint32_t I = 0; I < 4; ++I) {
+      if (I >= ChannelCount) Channels.push_back(zero(R->Element));
+      else if (Types[Value.Type].K != SpirvType::Vector) Channels.push_back(convert(Value, R->Element).Id);
+      else Channels.push_back(convert({valueOp(OpCompositeExtract, Types[Value.Type].Element, {Value.Id, I}), Types[Value.Type].Element}, R->Element).Id);
+    }
+    Value = {composite(vectorType(R->Element, 4), Channels), vectorType(R->Element, 4)};
     Body.emit(OpImageWrite, {Image, Target.ImageCoordinate, Value.Id});
     return true;
   }

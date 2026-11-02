@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #include "ProphetSpirvEmitterInternal.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "clang/Basic/SourceManager.h"
 
 using namespace clang;
@@ -9,12 +10,40 @@ using namespace llvm;
 namespace prophet {
 using namespace spv;
 
+// Sema flattens an aggregate vector prvalue into scalar initializers referring
+// to one OpaqueValueExpr. Follow only the transparent projection chain, never
+// calls, conditional arms, or nested initializers that own another evaluation.
+static const OpaqueValueExpr *initializerOpaque(const Expr *E) {
+  for (;;) {
+    if (const auto *O = dyn_cast<OpaqueValueExpr>(E)) return O;
+    if (const auto *P = dyn_cast<ParenExpr>(E)) E = P->getSubExpr();
+    else if (const auto *C = dyn_cast<CastExpr>(E)) E = C->getSubExpr();
+    else if (const auto *M = dyn_cast<MaterializeTemporaryExpr>(E)) E = M->getSubExpr();
+    else if (const auto *B = dyn_cast<CXXBindTemporaryExpr>(E)) E = B->getSubExpr();
+    else if (const auto *C = dyn_cast<ExprWithCleanups>(E)) E = C->getSubExpr();
+    else if (const auto *A = dyn_cast<ArraySubscriptExpr>(E)) E = A->getBase();
+    else if (const auto *M = dyn_cast<MemberExpr>(E)) E = M->getBase();
+    else if (const auto *V = dyn_cast<ExtVectorElementExpr>(E)) E = V->getBase();
+    else return nullptr;
+  }
+}
+
 SpirvValue ProphetSpirvEmitter::initialize(QualType T, ArrayRef<const Expr *> Values) {
   uint32_t ST = type(T); SpirvType Info = Types[ST];
   if (Values.empty()) return {zero(ST), ST, 7, T};
   if (Info.K != SpirvType::Struct && Info.K != SpirvType::Array &&
       Info.K != SpirvType::Vector && Info.K != SpirvType::Matrix)
     return convert(expression(Values.front()), ST, T);
+  auto SavedOpaque = OpaqueValues;
+  auto SavedOwners = InitializerOpaqueValues;
+  auto RestoreOpaque = scope_exit([&] {
+    OpaqueValues = std::move(SavedOpaque);
+    InitializerOpaqueValues = std::move(SavedOwners);
+  });
+  if (Info.K == SpirvType::Vector || Info.K == SpirvType::Matrix) {
+    for (const Expr *E : Values)
+      if (const auto *O = initializerOpaque(E)) InitializerOpaqueValues.insert(O);
+  }
   std::vector<SpirvValue> Parts;
   for (const Expr *E : Values) {
     SpirvValue V = load(expression(E));
@@ -69,7 +98,9 @@ SpirvValue ProphetSpirvEmitter::expression(const Expr *E) {
   if (const auto *D = dyn_cast<CXXDefaultInitExpr>(E)) return expression(D->getExpr());
   if (const auto *O = dyn_cast<OpaqueValueExpr>(E)) {
     if (auto I = OpaqueValues.find(O); I != OpaqueValues.end()) return I->second;
-    return expression(O->getSourceExpr());
+    SpirvValue Value = expression(O->getSourceExpr());
+    if (Value && InitializerOpaqueValues.count(O)) OpaqueValues[O] = Value;
+    return Value;
   }
   if (const auto *O = dyn_cast<HLSLOutArgExpr>(E)) return expression(O->getArgLValue());
   if (const auto *R = dyn_cast<DeclRefExpr>(E)) {
@@ -208,6 +239,12 @@ SpirvValue ProphetSpirvEmitter::expression(const Expr *E) {
   if (const auto *V = dyn_cast<ExtVectorElementExpr>(E)) {
     SpirvValue Base = expression(V->getBase());
     SmallVector<uint32_t, 4> Elements; V->getEncodedElementAccess(Elements);
+    // Keep the address of an lvalue, composing projections into its original
+    // lanes. Sema also produces nested projections while flattening a vector
+    // initializer, for example float4(v.xy, v.zw) contains (v.zw).x/.y.
+    // Replacing the pending swizzle would incorrectly reload v.x/.y.
+    if (!Base.Swizzle.empty())
+      for (uint32_t &Element : Elements) Element = Base.Swizzle[Element];
     Base.Swizzle.assign(Elements.begin(), Elements.end()); Base.ASTType = E->getType();
     return Base;
   }
@@ -243,6 +280,14 @@ SpirvValue ProphetSpirvEmitter::expression(const Expr *E) {
     if (const auto *Vector = A->getBase()->getType()->getAs<VectorType>();
         Vector && Vector->getNumElements() == 1) return Base;
     if (Base.Address) {
+      if (!Base.Swizzle.empty()) {
+        std::vector<uint32_t> Lanes;
+        for (uint32_t Lane : Base.Swizzle) Lanes.push_back(constant(integerType(), Lane));
+        Index.Id = Lanes.size() == 1 ? Lanes.front() :
+            valueOp(OpVectorExtractDynamic, integerType(),
+                {composite(vectorType(integerType(), Lanes.size()), Lanes), Index.Id});
+        Base.Swizzle.clear();
+      }
       uint32_t Element = Types[Base.Type].Element;
       return access(Base, {Index.Id}, E->getType(), Element);
     }
@@ -255,8 +300,22 @@ SpirvValue ProphetSpirvEmitter::expression(const Expr *E) {
   if (const auto *B = dyn_cast<BinaryOperator>(E)) return binary(B);
   if (const auto *U = dyn_cast<UnaryOperator>(E)) return unary(U);
   if (const auto *C = dyn_cast<ConditionalOperator>(E)) {
+    SpirvValue Condition = load(expression(C->getCond()));
+    if (!Condition) return {};
+    if (const auto *Vector = C->getCond()->getType()->getAs<VectorType>()) {
+      // Shader C++ retains HLSL's per-component truth conversion: every
+      // nonzero numeric lane is true, not just lane zero or the sign bit.
+      // Vector conditionals evaluate both values, then select each lane.
+      // Scalar C++ conditionals below retain their lazy control flow.
+      uint32_t T = type(E->getType());
+      Condition = convert(Condition, vectorType(boolType(), Vector->getNumElements()));
+      SpirvValue Yes = convert(expression(C->getTrueExpr()), T, E->getType());
+      SpirvValue No = convert(expression(C->getFalseExpr()), T, E->getType());
+      if (!Condition || !Yes || !No) return {};
+      return {valueOp(OpSelect, T, {Condition.Id, Yes.Id, No.Id}), T, 7, E->getType()};
+    }
     SpirvValue Result = temporary(E->getType());
-    SpirvValue Condition = convert(expression(C->getCond()), boolType());
+    Condition = convert(Condition, boolType());
     uint32_t Yes = id(), No = id(), Merge = id();
     Body.emit(OpSelectionMerge, {Merge, 0}); conditionalBranch(Condition.Id, Yes, No);
     ControlConditions.push_back(Condition.Id);
@@ -480,6 +539,9 @@ SpirvValue ProphetSpirvEmitter::call(const CallExpr *E) {
       store(Object, Args[0]); return Object;
     }
   std::string Name = F->getNameAsString();
+  if (hasShaderAnnotation(F, "prophet.descriptor_heap") ||
+      hasShaderAnnotation(F, "prophet.descriptor_handle"))
+    return descriptorHeapCall(E, Object, Args);
   if (Object.Type && Types[Object.Type].K == SpirvType::RayQuery)
     return rayQueryCall(Name, Object, E, Args);
   bool Handled = false;

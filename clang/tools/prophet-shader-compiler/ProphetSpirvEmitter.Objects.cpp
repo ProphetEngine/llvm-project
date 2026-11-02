@@ -350,10 +350,7 @@ bool ProphetSpirvEmitter::emitObjectFunction(size_t Index) {
 bool ProphetSpirvEmitter::runObject(StringRef ModuleId, std::vector<uint8_t> &Output, std::string &Manifest) {
   ObjectMode = true;
   ObjectModuleId = ModuleId.str();
-  // HLSL object and direct-entry compilation must honour the same source
-  // contract. Explicit precise remains conservatively transitive across the
-  // translation unit. C++ shader objects retain their existing strict default.
-  Precise = !Ctx.getLangOpts().HLSL || Ctx.getLangOpts().HLSLCPlusPlus || sourceUsesPrecise();
+  if (!selectFloatingPointContract()) return false;
   capability(Capability::Shader);
   capability(Capability::Linkage);
   scanObjectFunctions(Ctx.getTranslationUnitDecl());
@@ -465,12 +462,21 @@ bool ProphetSpirvEmitter::runObject(StringRef ModuleId, std::vector<uint8_t> &Ou
     }
     if (Pinned) {
       for (const auto &[Location, Owner] : Bindings)
-        if (Owner->getCanonicalDecl() == D->getCanonicalDecl()) {
+        if (Owner && Owner->getCanonicalDecl() == D->getCanonicalDecl()) {
           Item["set"] = Location.first;
           Item["binding"] = Location.second;
         }
     }
     ResourceJson.push_back(std::move(Item));
+  }
+  for (const auto &Resource : Resources) {
+    if (!Resource->Counter) continue;
+    const VarDecl *D = Resource->Decl;
+    std::string StableId = shaderAttributeString(shaderAttribute(D, "resource"));
+    if (StableId.empty()) StableId = D->getQualifiedNameAsString();
+    ResourceJson.push_back(json::Object{{"localId", Resource->Counter},
+      {"id", StableId + ".counter"}, {"name", D->getNameAsString() + ".counter"},
+      {"set", Resource->Set}, {"binding", Resource->CounterBinding}});
   }
   raw_string_ostream Stream(Manifest);
   Stream << json::Value(json::Object{{"formatVersion", 3}, {"valueAbiVersion", 1}, {"moduleId", ObjectModuleId}, {"entryComponentId", EntryComponent},

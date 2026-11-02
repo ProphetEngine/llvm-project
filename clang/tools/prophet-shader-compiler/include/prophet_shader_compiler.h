@@ -36,7 +36,9 @@ typedef enum ProphetShaderCompileFlags {
   // Explicit vk::binding and Prophet binding annotations bypass this mapping.
   PROPHET_SHADER_SEPARATE_REGISTER_CLASSES = 1u,
   // Enable native half and the explicit float16_t/int16_t/uint16_t families.
-  PROPHET_SHADER_ENABLE_16_BIT_TYPES = 2u
+  PROPHET_SHADER_ENABLE_16_BIT_TYPES = 2u,
+  // Explicit native arithmetic contract. Cannot override source precise.
+  PROPHET_SHADER_NATIVE_FLOATING_POINT = 4u
 } ProphetShaderCompileFlags;
 
 typedef enum ProphetShaderLanguage {

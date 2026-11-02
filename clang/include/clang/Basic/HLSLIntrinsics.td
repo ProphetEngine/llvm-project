@@ -390,7 +390,6 @@ otherwise, false.
 }];
   let ReturnType = BoolTy;
   let VaryingTypes = AllTypesWithBool;
-  let VaryingMatDims = [];
 }
 
 // Returns the boolean AND of two boolean scalars, vectors, or matrices.
@@ -414,7 +413,6 @@ otherwise, false.
 }];
   let ReturnType = BoolTy;
   let VaryingTypes = AllTypesWithBool;
-  let VaryingMatDims = [];
 }
 
 // Reinterprets a cast value (two 32-bit values) into a double.

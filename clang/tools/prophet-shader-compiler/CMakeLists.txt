@@ -7,6 +7,7 @@ add_clang_library(prophet_shader_compiler SHARED
   ProphetSpirvEmitter.Types.cpp
   ProphetSpirvEmitter.Matrices.cpp
   ProphetSpirvEmitter.Resources.cpp
+  ProphetSpirvEmitter.DescriptorHeaps.cpp
   ProphetSpirvEmitter.Expressions.cpp
   ProphetSpirvEmitter.Statements.cpp
   ProphetSpirvEmitter.Stages.cpp

@@ -53,6 +53,7 @@ struct SpirvValue {
   SpirvResource *Resource = nullptr;
   std::shared_ptr<SpirvClosure> Closure;
   uint32_t ImageCoordinate = 0;
+  uint32_t HeapIndex = 0;
   bool DescriptorSelected = false, Stream = false;
   const clang::ValueDecl *Interface = nullptr;
   std::vector<uint32_t> InterfacePath;
@@ -72,7 +73,9 @@ struct SpirvResource {
   const clang::VarDecl *Decl = nullptr;
   QualType ElementType;
   uint32_t Variable = 0, Type = 0, Element = 0, Set = 0, Binding = 0;
-  uint32_t Dimension = 1, Count = 1;
+  uint32_t Counter = 0, CounterBinding = 0;
+  uint32_t Heap = 0; // Nonzero for a typed view into a directly indexed descriptor heap.
+  uint32_t Dimension = 1, Count = 1, ImageFormat = 0;
   bool Arrayed = false, Multisample = false, Depth = false, ReadOnly = false;
   bool CppRecord = false, Uniform = false;
 };
@@ -83,6 +86,7 @@ struct SpirvInterface {
   uint32_t Variable = 0, Type = 0, Storage = 1, ArraySize = 0;
   bool Patch = false, Primitive = false;
   std::string Semantic;
+  uint32_t DistanceOffset = ~0u;
 };
 
 class ProphetSpirvEmitter {
@@ -104,6 +108,11 @@ class ProphetSpirvEmitter {
   std::map<std::tuple<const void *, SpirvLayout, bool>, uint32_t> ASTTypes;
   std::map<const clang::ValueDecl *, SpirvValue> Globals, Locals;
   std::vector<std::unique_ptr<SpirvResource>> Resources;
+  uint32_t DescriptorHeaps[2] = {}, DescriptorHeapStrides[2] = {};
+  std::set<uint32_t> DescriptorHeapArrays;
+  SpirvValue descriptorHeapCall(const clang::CallExpr *E, SpirvValue Object,
+                               llvm::ArrayRef<SpirvValue> Args);
+  SpirvValue descriptorHeapValue(SpirvResource *Resource, QualType ResourceType, SpirvValue Index);
   std::map<std::pair<uint32_t, uint32_t>, const clang::Decl *> Bindings;
   std::vector<const clang::FunctionDecl *> EntryFunctions;
   std::vector<const clang::VarDecl *> GlobalSemanticDecls;
@@ -147,6 +156,7 @@ class ProphetSpirvEmitter {
     const clang::FunctionDecl *Function = nullptr;
     SpirvValue Result;
     SpirvValue Returned;
+    SpirvValue ResourceResult;
     uint32_t Merge = 0;
     size_t CleanupDepth = 0;
     std::vector<uint32_t> ReturnConditions;
@@ -238,6 +248,7 @@ class ProphetSpirvEmitter {
   SpirvValue matrixMultiply(SpirvValue A, SpirvValue B, QualType Result);
   std::vector<uint32_t> ArrayInitIndices;
   std::map<const clang::OpaqueValueExpr *, SpirvValue> OpaqueValues;
+  std::set<const clang::OpaqueValueExpr *> InitializerOpaqueValues;
   SpirvValue expression(const clang::Expr *E);
   SpirvValue binary(const clang::BinaryOperator *E);
   SpirvValue unary(const clang::UnaryOperator *E);
@@ -253,21 +264,27 @@ class ProphetSpirvEmitter {
   SpirvValue resourceCall(StringRef Name, SpirvValue Object, const clang::CallExpr *E,
                           llvm::ArrayRef<SpirvValue> Args, bool &Handled);
   SpirvValue imageCall(StringRef Name, SpirvResource &R, const clang::CallExpr *E,
-                       llvm::ArrayRef<SpirvValue> Args);
+                       llvm::ArrayRef<SpirvValue> Args, uint32_t LoadedImage = 0);
+  SpirvValue rawBufferLoad(SpirvValue Resource, SpirvValue ByteOffset, QualType ValueType);
+  static bool isRowMajor(QualType T);
   SpirvValue resourceIndex(SpirvValue Object, SpirvValue Index, QualType T);
   bool statement(const clang::Stmt *S);
   bool declaration(const clang::Decl *D);
   bool conditional(const clang::IfStmt *S);
   bool loop(const clang::Stmt *S);
+  uint32_t loopControl(const clang::Stmt *S);
+  std::map<const clang::Stmt *, uint32_t> ExplicitLoopControls;
+  uint32_t BoundedLoopGrowth = 0;
   bool rangeFor(const clang::CXXForRangeStmt *S);
   bool switchStmt(const clang::SwitchStmt *S);
   void label(uint32_t Id);
   void branch(uint32_t Id);
   void conditionalBranch(uint32_t Condition, uint32_t Yes, uint32_t No);
   void scan(const clang::DeclContext *DC);
-  bool sourceUsesPrecise() const;
+  bool sourceUsesPrecise(bool &FloatingPointPragma) const;
+  bool selectFloatingPointContract();
   bool global(const clang::VarDecl *D);
-  bool resource(const clang::VarDecl *D);
+  bool resource(const clang::VarDecl *D, SpirvResource **TypeOnly = nullptr);
   bool constantBuffer(const clang::HLSLBufferDecl *D);
   bool binding(const clang::NamedDecl *D, uint32_t &Set, uint32_t &Binding);
   uint32_t globalVariable(uint32_t T, uint32_t Storage, StringRef Name, uint32_t Initializer = 0);
@@ -289,6 +306,7 @@ class ProphetSpirvEmitter {
   QualType componentType(QualType T, uint32_t Index);
   SpirvValue interfaceReference(const clang::ValueDecl *D, QualType T, uint32_t Storage);
   SpirvValue interfaceAddress(SpirvValue V);
+  bool splitDistanceInterface(SpirvValue V);
   SpirvValue loadInterface(SpirvValue V);
   bool storeInterface(SpirvValue Target, SpirvValue Value);
   SpirvValue interfaceInput(const clang::ValueDecl *D, QualType T, uint32_t Index = 0);

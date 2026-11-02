@@ -264,7 +264,7 @@ uint32_t compileOne(const ProphetShaderCompileRequest &Request,
     Diagnostic = "task, mesh and ray shader binaries require Vulkan 1.2 or later";
     return PROPHET_SHADER_STATUS_UNSUPPORTED_FEATURE;
   }
-  if (Request.optimization_level > 3 || (Request.flags & ~(PROPHET_SHADER_SEPARATE_REGISTER_CLASSES | PROPHET_SHADER_ENABLE_16_BIT_TYPES)) != 0) {
+  if (Request.optimization_level > 3 || (Request.flags & ~(PROPHET_SHADER_SEPARATE_REGISTER_CLASSES | PROPHET_SHADER_ENABLE_16_BIT_TYPES | PROPHET_SHADER_NATIVE_FLOATING_POINT)) != 0) {
     Diagnostic = "invalid optimization level or unknown compiler flags";
     return PROPHET_SHADER_STATUS_INVALID_ARGUMENT;
   }
@@ -332,7 +332,14 @@ uint32_t compileOne(const ProphetShaderCompileRequest &Request,
       Diagnostic = ("disallowed shader compiler argument: " + Arg).str();
       return PROPHET_SHADER_STATUS_INVALID_ARGUMENT;
     }
-    Args.emplace_back(Arg);
+    if (Arg.starts_with("-isystem=")) {
+      // The ABI accepts one self-contained argument; cc1 expects the path as
+      // a separate value. Forwarding '=' makes it part of the directory name.
+      Args.emplace_back("-isystem");
+      Args.emplace_back(Arg.drop_front(9));
+    } else {
+      Args.emplace_back(Arg);
+    }
   }
   Args.push_back(SourceName);
   std::vector<const char *> Argv;
